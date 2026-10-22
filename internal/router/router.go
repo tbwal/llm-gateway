@@ -9,12 +9,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"llm-gateway/internal/crypto"
 	"llm-gateway/internal/handler"
 )
 
 // New 创建 gin 引擎并注册全部路由
-// 参数 db：数据库句柄，路由层把它注入给业务处理器（依赖往下传递）
-func New(db *gorm.DB) *gin.Engine {
+// 参数 db：数据库句柄；enc：加密服务（API Key 落库加密/转发解密）
+// 路由层把两者注入给业务处理器（依赖往下传递）
+func New(db *gorm.DB, enc crypto.Service) *gin.Engine {
 	// gin.Default()：自带日志中间件 + panic 恢复中间件
 	r := gin.Default()
 
@@ -24,7 +26,7 @@ func New(db *gorm.DB) *gin.Engine {
 	})
 
 	// 渠道管理（第 3 步：完整 CRUD）
-	ch := handler.NewChannelHandler(db) // 依赖注入：把 db 传给渠道处理器
+	ch := handler.NewChannelHandler(db, enc) // 依赖注入：把 db 和加密服务传给渠道处理器
 	api := r.Group("/api/channels")     // 路由分组：组内路径自动带 /api/channels 前缀
 	{
 		// 裸花括号：只用于视觉分组，不影响逻辑
@@ -37,7 +39,7 @@ func New(db *gorm.DB) *gin.Engine {
 
 	// AI 网关统一入口（第 4 步：转发）
 	// 客户端只调这一个接口，背后转发到哪个渠道由网关决定
-	relay := handler.NewRelayHandler(db)
+	relay := handler.NewRelayHandler(db, enc)
 	r.POST("/v1/chat/completions", relay.ChatCompletions)
 
 	return r

@@ -9,21 +9,24 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"llm-gateway/internal/crypto"
 	"llm-gateway/internal/model"
 )
 
 // ChannelHandler 渠道接口处理器
 //
-// 关键设计：把数据库句柄 db 存进结构体 —— 这叫"依赖注入"的雏形
+// 关键设计：把数据库句柄 db 和加密服务 enc 存进结构体 —— 这叫"依赖注入"的雏形
 //   - 不用全局变量，处理器需要什么就通过构造器传入什么
 //   - 好处：可测试（换一个 mock 库）、可替换、职责清晰
+//   - enc：API Key 落库前必须加密，绝不明文入库
 type ChannelHandler struct {
-	db *gorm.DB
+	db  *gorm.DB
+	enc crypto.Service
 }
 
 // NewChannelHandler 构造器：把数据库依赖注入处理器
-func NewChannelHandler(db *gorm.DB) *ChannelHandler {
-	return &ChannelHandler{db: db}
+func NewChannelHandler(db *gorm.DB, enc crypto.Service) *ChannelHandler {
+	return &ChannelHandler{db: db, enc: enc}
 }
 
 // resp 统一响应函数：所有接口同一格式 {code, message, data}
@@ -61,14 +64,25 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 		return
 	}
 
-	// ② GORM 写库：INSERT INTO channels (...) VALUES (...)
+	// ② 密钥加密：API Key 绝不明文落库
+	// 加密后才写库，库里只存 hex 密文（解密动作在转发时由 relay 做）
+	if ch.APIKey != "" {
+		encKey, err := h.enc.Encrypt(ch.APIKey)
+		if err != nil {
+			resp(c, 500, "密钥加密失败: "+err.Error(), nil)
+			return
+		}
+		ch.APIKey = encKey // 用密文替换明文，后续 GORM 落库的就是密文
+	}
+
+	// ③ GORM 写库：INSERT INTO channels (...) VALUES (...)
 	//    - ID（自增）和 CreatedAt（当前时间）由数据库/GORM 自动填充
 	if err := h.db.Create(&ch).Error; err != nil {
 		resp(c, 500, "创建失败: "+err.Error(), nil)
 		return
 	}
 
-	// ③ 返回创建成功的渠道（走 channelView，密钥不返回）
+	// ④ 返回创建成功的渠道（走 channelView，密钥不返回）
 	resp(c, 0, "ok", channelView(ch))
 }
 
@@ -146,13 +160,25 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 	//    为什么不用 结构体 更新？因为 GORM 用结构体更新会"忽略零值"——
 	//    比如 weight 传 0、enabled 传 false，会被当成"没传"而跳过更新
 	//    用 map 更新则 0/false 也会真实写入
+	//
+	//    ⚠️ api_key 特殊处理：留空 = 不更新（保持原密钥）
+	//       - 防止"没传密钥"把库里密钥清成空串（原实现的隐患）
+	//       - 防止把空串加密成密文写进去
+	//       只有传了非空密钥才加密后更新
 	updates := map[string]any{
 		"name":     req.Name,
 		"provider": req.Provider,
 		"base_url": req.BaseURL,
-		"api_key":  req.APIKey,
 		"weight":   req.Weight,
 		"enabled":  req.Enabled,
+	}
+	if req.APIKey != "" {
+		encKey, err := h.enc.Encrypt(req.APIKey)
+		if err != nil {
+			resp(c, 500, "密钥加密失败: "+err.Error(), nil)
+			return
+		}
+		updates["api_key"] = encKey
 	}
 	// Model(&ch)：锁定更新目标是 ch 这张表的 id 行；Updates 只更新给定字段
 	if err := h.db.Model(&ch).Updates(updates).Error; err != nil {

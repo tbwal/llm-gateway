@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"llm-gateway/internal/crypto"
 	"llm-gateway/internal/model"
 )
 
@@ -24,15 +25,17 @@ import (
 type RelayHandler struct {
 	db     *gorm.DB     // 数据库：查渠道配置
 	client *http.Client // 转发专用的 HTTP 客户端（带超时，防止上游拖死我们）
+	enc    crypto.Service // 加密服务：渠道 API Key 从库里取出来是密文，转发前先解密
 }
 
-// NewRelayHandler 构造器：注入 db，创建带超时的转发客户端
-func NewRelayHandler(db *gorm.DB) *RelayHandler {
+// NewRelayHandler 构造器：注入 db 和加密服务，创建带超时的转发客户端
+func NewRelayHandler(db *gorm.DB, enc crypto.Service) *RelayHandler {
 	return &RelayHandler{
 		db: db,
 		client: &http.Client{
 			Timeout: 30 * time.Second, // 30 秒没收到上游响应就放弃
 		},
+		enc: enc,
 	}
 }
 
@@ -124,6 +127,19 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		// 上游地址 = 渠道 base_url + /chat/completions
 		// 例：base_url=http://localhost:9090/v1 → http://localhost:9090/v1/chat/completions
 		upstreamURL := strings.TrimRight(ch.BaseURL, "/") + "/chat/completions"
+
+		// ⚠️ 密钥解密（第 5 步：AES-GCM 落库加密配套动作）：
+		// 库里存的 api_key 是密文，必须解成明文才能冒充"上游的合法用户"。
+		// DecryptOrRaw 兼容旧明文数据：老库里未加密的 sk-xxx 会原样返回。
+		// 解密失败（密钥不匹配/密文损坏）→ 记入已试，换下一个渠道，
+		// 绝不把密文当密钥发给上游（那会 401，还暴露内部格式）。
+		apiKey, err := h.enc.DecryptOrRaw(ch.APIKey)
+		if err != nil {
+			log.Printf("[relay] 渠道 id=%d 密钥解密失败: %v，尝试下一个", ch.ID, err)
+			tried[ch.ID] = struct{}{}
+			continue
+		}
+
 		req, err := http.NewRequest(http.MethodPost, upstreamURL, bytes.NewReader(body))
 		if err != nil {
 			resp(c, 500, "构造上游请求失败: "+err.Error(), nil)
@@ -131,9 +147,9 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		}
 		// 透传两个关键头：
 		//   - Content-Type：告诉上游"我发的是 JSON"
-		//   - Authorization：用渠道的密钥冒充"我就是 DeepSeek 的合法用户"
+		//   - Authorization：用解密后的渠道密钥冒充"我就是 DeepSeek 的合法用户"
 		req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-		req.Header.Set("Authorization", "Bearer "+ch.APIKey)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 
 		// 发出请求（阻塞等上游响应）
 		upResp, err := h.client.Do(req)

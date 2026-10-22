@@ -8,6 +8,9 @@ import "os"
 type Config struct {
 	Port   string // 监听端口（默认 8080）
 	DBPath string // SQLite 数据库文件路径（默认 data/llm-gateway.db）
+	// SecretKey 渠道 API Key 的加密密钥（环境变量 LLM_GATEWAY_SECRET_KEY，64 位 hex）
+	// 未设置时返回空串，由 crypto.NewService 回退到开发默认密钥（仅限本地开发）
+	SecretKey string
 }
 
 // Load 从环境变量读取配置，未设置时使用默认值
@@ -30,5 +33,9 @@ func Load() Config {
 	if dbPath == "" {
 		dbPath = "data/llm-gateway.db"
 	}
-	return Config{Port: port, DBPath: dbPath}
+
+	// LLM_GATEWAY_SECRET_KEY：渠道 API Key 的 AES 加密密钥
+	// 生产环境必须设置；留空则由 crypto.NewService 使用开发默认密钥（并打警告日志）
+	secretKey := os.Getenv("LLM_GATEWAY_SECRET_KEY")
+	return Config{Port: port, DBPath: dbPath, SecretKey: secretKey}
 }
