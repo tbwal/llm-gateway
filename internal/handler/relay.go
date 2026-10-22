@@ -87,8 +87,23 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 	log.Printf("[relay] 上游返回 %d", upResp.StatusCode)
 
 	// ⑤ 把上游的响应"原样"搬回给客户端：
-	//    状态码透传（如 200） + Content-Type 透传 + 响应体逐字节复制
-	c.Status(upResp.StatusCode)
-	c.Header("Content-Type", upResp.Header.Get("Content-Type"))
-	io.Copy(c.Writer, upResp.Body) // 流式复制：边收边发，不用等全部读完
+	//    状态码透传（如 200）+ Content-Type 透传 + 响应体逐字节流式复制
+	//
+	//    ⚠️ 顺序坑（SSE 场景尤其致命）：
+	//    必须先 Header 再 Status！因为 c.Status() 会立即把响应头发出去，
+	//    一旦发出，后面的 Header 设置全部无效（HTTP 头在身体之前、且只发一次）
+	//    —— 否则 Content-Type: text/event-stream 会丢失，客户端拿到普通文本，
+	//    流式效果直接坏掉
+	c.Header("Content-Type", upResp.Header.Get("Content-Type")) // 先设头
+	c.Status(upResp.StatusCode)                                 // 再写状态码（头随之发出）
+
+	// 流式复制：边收边发，不用等全部读完
+	// SSE 场景：上游每来一块（Flush 一次），io.Copy 就把这一块立即写给客户端
+	io.Copy(c.Writer, upResp.Body)
+
+	// SSE 场景收尾：手动 Flush 一次，确保最后一截数据也立即送达客户端
+	// （gin 的 Writer 通常直接写底层连接，但对某些中间件/代理，最后一块可能还卡在缓冲里）
+	if f, ok := c.Writer.(http.Flusher); ok {
+		f.Flush()
+	}
 }

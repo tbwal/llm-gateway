@@ -45,7 +45,7 @@ Content-Type: application/json
 }
 
 ### 6. 删除渠道（把 3 换成真实 id）
-DELETE http://localhost:8080/api/channels/3
+DELETE http://localhost:8080/api/channels/
 
 ### 7. 删除不存在的渠道（应返回 404）
 DELETE http://localhost:8080/api/channels/999
@@ -60,5 +60,19 @@ Content-Type: application/json
   "model": "mock-upstream",
   "messages": [
     {"role": "user", "content": "你好，网关在吗？"}
+  ]
+}
+
+### 9. 网关 SSE 流式（打字机效果）
+# 前置：mock 上游正在运行（go run ./cmd/mockupstream）
+# 用 curl -N（不缓冲）才能看到逐块输出；REST Client 会等流结束再显示
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "mock-upstream",
+  "stream": true,
+  "messages": [
+    {"role": "user", "content": "来一段流式回复"}
   ]
 }
