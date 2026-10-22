@@ -50,13 +50,15 @@ DELETE http://localhost:8080/api/channels/3
 ### 7. 删除不存在的渠道（应返回 404）
 DELETE http://localhost:8080/api/channels/999
 
-### 8. AI 网关统一入口（W1 中后段可用）
-# POST http://localhost:8080/v1/chat/completions
-# Authorization: Bearer <你的AccessKey>
-# Content-Type: application/json
-#
-# {
-#   "model": "deepseek-chat",
-#   "messages": [{"role": "user", "content": "你好"}],
-#   "stream": false
-# }
+### 8. AI 网关统一入口（第 4 步：转发到渠道上游）
+# 前置：渠道的 base_url 指向 mock 上游（http://localhost:9090/v1）
+# 先开 mock：go run ./cmd/mockupstream，再调下面接口
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "mock-upstream",
+  "messages": [
+    {"role": "user", "content": "你好，网关在吗？"}
+  ]
+}

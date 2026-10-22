@@ -35,5 +35,10 @@ func New(db *gorm.DB) *gin.Engine {
 		api.DELETE("/:id", ch.Delete) // 删除：DELETE /api/channels/3
 	}
 
+	// AI 网关统一入口（第 4 步：转发）
+	// 客户端只调这一个接口，背后转发到哪个渠道由网关决定
+	relay := handler.NewRelayHandler(db)
+	r.POST("/v1/chat/completions", relay.ChatCompletions)
+
 	return r
 }
