@@ -96,7 +96,16 @@ func handleStream(w http.ResponseWriter) {
 		time.Sleep(200 * time.Millisecond) // 模拟大模型"思考+生成"的耗时
 	}
 
-	// ④ SSE 结束标记（OpenAI 约定的 [DONE]）
+	// ④ 流结束前，OpenAI 真实上游会先发两条元数据：
+	//    - finish_reason：本轮生成结束的原因（stop / length / tool_calls）
+	//    - usage：用量统计（部分上游放在最后一条事件）
+	//    网关的 SSE 增量转换要能透传它们（relay.go 的 parseSSEChunk/render）
+	fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n")
+	flusher.Flush()
+	fmt.Fprint(w, "data: {\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":10,\"total_tokens\":22}}\n\n")
+	flusher.Flush()
+
+	// ⑤ SSE 结束标记（OpenAI 约定的 [DONE]）
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
