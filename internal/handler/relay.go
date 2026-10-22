@@ -2,10 +2,10 @@
 package handler
 
 import (
-	"bytes"      // 字节缓冲：把读出来的请求体重建成流
-	"io"         // 流操作：读取请求体、复制响应体
-	"log"        // 日志：记录转发链路
-	"math/rand/v2" // 随机数：加权随机选渠道（rand.IntN 是 Go 1.22+ 推荐写法）
+	"bytes"         // 字节缓冲：把读出来的请求体重建成流
+	"io"            // 流操作：读取请求体、复制响应体
+	"log"           // 日志：记录转发链路
+	"math/rand/v2"  // 随机数：加权随机选渠道（rand.IntN 是 Go 1.22+ 推荐写法）
 	"net/http"
 	"strings" // 字符串处理：去掉 base_url 末尾多余的 /
 	"time"
@@ -36,7 +36,9 @@ func NewRelayHandler(db *gorm.DB) *RelayHandler {
 	}
 }
 
-// pickChannel 按权重加权随机选一个启用的渠道（W2：调度器雏形）
+// pickChannel 按权重加权随机选一个启用的渠道（W2 调度 + W3 排除已试）
+//
+// excluded：已经试过且失败的渠道 ID 集合（故障转移的核心：失败的不再选）
 //
 // 算法（前缀区间法）：
 //   权重数组 [1, 2, 3] → 总权重 6 → 想象一条分成 1:2:3 三段的刻度尺
@@ -44,37 +46,41 @@ func NewRelayHandler(db *gorm.DB) *RelayHandler {
 //     n=0       → 渠道A（概率 1/6）
 //     n=1,2     → 渠道B（概率 2/6）
 //     n=3,4,5   → 渠道C（概率 3/6）
-//
-// 为什么用加权随机而不是轮询？真实网关里渠道有配额差异（贵的少调、便宜的多调），
-// 权重就是"配额比例"。轮询是"均等分配"，加权随机才是"按比例分配"。
-func (h *RelayHandler) pickChannel() (model.Channel, error) {
+func (h *RelayHandler) pickChannel(excluded map[uint]struct{}) (model.Channel, error) {
 	// ① 查出所有启用的渠道（enabled = true）
 	var list []model.Channel
 	if err := h.db.Where("enabled = ?", true).Find(&list).Error; err != nil {
 		return model.Channel{}, err
 	}
-	if len(list) == 0 {
-		return model.Channel{}, gorm.ErrRecordNotFound // 复用"找不到记录"的错误语义
-	}
 
-	// ② 计算总权重（weight < 1 按 1 算，防止 0 权重渠道永远不会被选中）
-	total := 0
+	// ② 过滤：跳过已试失败的渠道 + 权重保底（<1 按 1 算）
+	candidates := make([]model.Channel, 0, len(list))
 	for _, ch := range list {
-		if ch.Weight < 1 {
+		if _, tried := excluded[ch.ID]; tried { // 这个渠道已经试过且失败 → 排除
+			continue
+		}
+		if ch.Weight < 1 { // 防止 0 权重渠道永远不会被选中
 			ch.Weight = 1
 		}
-		total += ch.Weight
+		candidates = append(candidates, ch)
+	}
+	if len(candidates) == 0 {
+		return model.Channel{}, gorm.ErrRecordNotFound // 没有可用的了（全试完/无启用渠道）
 	}
 
-	// ③ 生成 [0, total) 的随机数，逐段扣减定位区间
-	n := rand.IntN(total) // Go 1.22+ 的推荐写法（旧版是 rand.Intn，已废弃）
-	for _, ch := range list {
+	// ③ 计算总权重，生成 [0, total) 随机数，逐段扣减定位区间
+	total := 0
+	for _, ch := range candidates {
+		total += ch.Weight
+	}
+	n := rand.IntN(total)
+	for _, ch := range candidates {
 		n -= ch.Weight
 		if n < 0 { // 掉进这个渠道的区间 → 选中它
 			return ch, nil
 		}
 	}
-	return list[len(list)-1], nil // 兜底：理论上不会走到这
+	return candidates[len(candidates)-1], nil // 兜底：理论上不会走到这
 }
 
 // ChatCompletions POST /v1/chat/completions —— 网关统一入口
@@ -85,68 +91,93 @@ func (h *RelayHandler) pickChannel() (model.Channel, error) {
 //	             └────── 转发请求 ──────┘
 //	             ←────── 带回响应 ──────┘
 func (h *RelayHandler) ChatCompletions(c *gin.Context) {
-	// ① 选渠道（W2 升级）：按权重加权随机选一个启用渠道
-	//    W3 会进一步叠加"健康度"（故障转移：挂了的上游自动降权/剔除）
-	var ch model.Channel
-	ch, err := h.pickChannel()
-	if err != nil {
-		// 503 Service Unavailable：服务不可用（不是调用方的问题，是"没渠道可转发"）
-		resp(c, 503, "无可用渠道", nil)
-		return
-	}
-	log.Printf("[relay] 加权选中渠道 id=%d name=%s weight=%d → %s", ch.ID, ch.Name, ch.Weight, ch.BaseURL)
-
-	// ② 读出客户端的请求体
-	//    ⚠️ body 是"流"：只能读一次。这里读出来，后面要重建给上游
+	// ① 读出客户端的请求体（只读一次，各次重试复用同一份 body）
+	//    ⚠️ body 是"流"：只能读一次。这里读出来，后面要重建给每个候选上游
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		resp(c, 400, "读取请求体失败: "+err.Error(), nil)
 		return
 	}
 
-	// ③ 构造发给上游的请求
-	//    上游地址 = 渠道 base_url + /chat/completions
-	//    例：base_url=http://localhost:9090/v1 → http://localhost:9090/v1/chat/completions
-	upstreamURL := strings.TrimRight(ch.BaseURL, "/") + "/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, upstreamURL, bytes.NewReader(body))
-	if err != nil {
-		resp(c, 500, "构造上游请求失败: "+err.Error(), nil)
+	// ② 故障转移循环（W3 核心）：
+	//    选渠道 → 转发 → 失败（网络错误/5xx）→ 记录已试 → 换下一个
+	//    ⚠️ 关键边界（面试必讲）：
+	//    只能在"拿到上游响应之前"切换渠道！
+	//    一旦拿到响应（哪怕只是响应头），客户端就开始消费数据了——
+	//    此时再换渠道重试，客户端会收到"半截回复 + 另一个渠道的回复"，比失败更糟
+	//    所以：成功拿到响应 → 立即锁定并透传，绝不再切换（尤其 SSE 流式）
+	tried := make(map[uint]struct{}) // 已尝试过的渠道集合（去重，防止无限循环）
+	for {
+		ch, err := h.pickChannel(tried)
+		if err != nil {
+			// 没有候选渠道了：区分"从来没渠道"和"全试完都失败"
+			if len(tried) > 0 {
+				resp(c, 502, "所有渠道均不可用", nil) // 网关尽力了，全是上游的锅
+			} else {
+				resp(c, 503, "无可用渠道", nil)
+			}
+			return
+		}
+		log.Printf("[relay] 尝试渠道 id=%d name=%s weight=%d → %s", ch.ID, ch.Name, ch.Weight, ch.BaseURL)
+
+		// 构造发给上游的请求
+		// 上游地址 = 渠道 base_url + /chat/completions
+		// 例：base_url=http://localhost:9090/v1 → http://localhost:9090/v1/chat/completions
+		upstreamURL := strings.TrimRight(ch.BaseURL, "/") + "/chat/completions"
+		req, err := http.NewRequest(http.MethodPost, upstreamURL, bytes.NewReader(body))
+		if err != nil {
+			resp(c, 500, "构造上游请求失败: "+err.Error(), nil)
+			return
+		}
+		// 透传两个关键头：
+		//   - Content-Type：告诉上游"我发的是 JSON"
+		//   - Authorization：用渠道的密钥冒充"我就是 DeepSeek 的合法用户"
+		req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
+		req.Header.Set("Authorization", "Bearer "+ch.APIKey)
+
+		// 发出请求（阻塞等上游响应）
+		upResp, err := h.client.Do(req)
+		if err != nil {
+			// 网络层失败（连不上/超时）→ 记入已试，换下一个渠道
+			log.Printf("[relay] 渠道 id=%d 网络失败: %v，尝试下一个", ch.ID, err)
+			tried[ch.ID] = struct{}{}
+			continue
+		}
+
+		// 上游给了明确响应，按状态码分流：
+		if upResp.StatusCode >= 500 {
+			// 5xx = 上游服务器故障 → 值得换渠道重试
+			log.Printf("[relay] 渠道 id=%d 返回 %d，尝试下一个", ch.ID, upResp.StatusCode)
+			upResp.Body.Close() // 显式关闭，释放连接（不用 defer——循环里会累积）
+			tried[ch.ID] = struct{}{}
+			continue
+		}
+
+		// 4xx/3xx/2xx：请求本身的结果（成功/参数错/限流），直接透传，不再重试
+		//   为什么 4xx 不重试？400 是请求体坏、404 是路径错、401 是密钥错——
+		//   换任何渠道结果都一样，重试纯属浪费
+		//   ⚠️ 从此处起渠道已锁定：响应开始流向客户端，故障转移到此为止
+		defer upResp.Body.Close()
+		log.Printf("[relay] 渠道 id=%d 返回 %d，锁定并透传", ch.ID, upResp.StatusCode)
+
+		// 把上游的响应"原样"搬回给客户端：
+		//   状态码透传 + Content-Type 透传 + 响应体逐字节流式复制
+		//
+		//   ⚠️ 顺序坑（SSE 场景尤其致命）：
+		//   必须先 Header 再 Status！因为 c.Status() 会立即把响应头发出去，
+		//   一旦发出，后面的 Header 设置全部无效（HTTP 头在身体之前、且只发一次）
+		//   —— 否则 Content-Type: text/event-stream 会丢失，客户端拿到普通文本
+		c.Header("Content-Type", upResp.Header.Get("Content-Type")) // 先设头
+		c.Status(upResp.StatusCode)                                 // 再写状态码（头随之发出）
+
+		// 流式复制：边收边发，不用等全部读完
+		// SSE 场景：上游每来一块（Flush 一次），io.Copy 就把这一块立即写给客户端
+		io.Copy(c.Writer, upResp.Body)
+
+		// SSE 场景收尾：手动 Flush 一次，确保最后一截数据也立即送达客户端
+		if f, ok := c.Writer.(http.Flusher); ok {
+			f.Flush()
+		}
 		return
-	}
-	// 透传两个关键头：
-	//   - Content-Type：告诉上游"我发的是 JSON"
-	//   - Authorization：用渠道的密钥冒充"我就是 DeepSeek 的合法用户"
-	req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-	req.Header.Set("Authorization", "Bearer "+ch.APIKey)
-
-	// ④ 真正发出请求（阻塞等上游响应）
-	upResp, err := h.client.Do(req)
-	if err != nil {
-		// 502 Bad Gateway：网关连不上上游（mock 没启动？密钥错？）
-		resp(c, 502, "上游不可达: "+err.Error(), nil)
-		return
-	}
-	defer upResp.Body.Close()
-	log.Printf("[relay] 上游返回 %d", upResp.StatusCode)
-
-	// ⑤ 把上游的响应"原样"搬回给客户端：
-	//    状态码透传（如 200）+ Content-Type 透传 + 响应体逐字节流式复制
-	//
-	//    ⚠️ 顺序坑（SSE 场景尤其致命）：
-	//    必须先 Header 再 Status！因为 c.Status() 会立即把响应头发出去，
-	//    一旦发出，后面的 Header 设置全部无效（HTTP 头在身体之前、且只发一次）
-	//    —— 否则 Content-Type: text/event-stream 会丢失，客户端拿到普通文本，
-	//    流式效果直接坏掉
-	c.Header("Content-Type", upResp.Header.Get("Content-Type")) // 先设头
-	c.Status(upResp.StatusCode)                                 // 再写状态码（头随之发出）
-
-	// 流式复制：边收边发，不用等全部读完
-	// SSE 场景：上游每来一块（Flush 一次），io.Copy 就把这一块立即写给客户端
-	io.Copy(c.Writer, upResp.Body)
-
-	// SSE 场景收尾：手动 Flush 一次，确保最后一截数据也立即送达客户端
-	// （gin 的 Writer 通常直接写底层连接，但对某些中间件/代理，最后一块可能还卡在缓冲里）
-	if f, ok := c.Writer.(http.Flusher); ok {
-		f.Flush()
 	}
 }
