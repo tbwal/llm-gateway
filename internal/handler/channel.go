@@ -2,7 +2,9 @@
 package handler
 
 import (
+	"errors" // 错误判断：errors.Is 识别"记录不存在"
 	"net/http"
+	"strconv" // 字符串转整数：解析路径里的 :id
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -86,4 +88,109 @@ func (h *ChannelHandler) List(c *gin.Context) {
 		views = append(views, channelView(ch))
 	}
 	resp(c, 0, "ok", views)
+}
+
+// Get GET /api/channels/:id —— 渠道详情
+// 流程：id 转整数 → 按主键查询 → 存在返回 / 不存在 404
+func (h *ChannelHandler) Get(c *gin.Context) {
+	// ① 路径参数 :id 是字符串，转成整数才能查数据库
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil { // 转换失败（如 "abc"）→ 参数错误
+		resp(c, 400, "id 无效", nil)
+		return
+	}
+
+	var ch model.Channel
+	// ② 按主键查询：First(&ch, id) 等价 SELECT * FROM channels WHERE id = ?
+	//    ⚠️ 查不到时返回 gorm.ErrRecordNotFound（要单独判断，不能当 500）
+	if err := h.db.First(&ch, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) { // 精确识别"记录不存在"
+			resp(c, 404, "渠道不存在", nil)
+		} else { // 其他数据库错误
+			resp(c, 500, "查询失败: "+err.Error(), nil)
+		}
+		return
+	}
+	resp(c, 0, "ok", channelView(ch)) // ③ 走对外视图，密钥不返回
+}
+
+// Update PUT /api/channels/:id —— 更新渠道
+// 流程：id 转整数 → 确认存在 → 解析请求体 → map 更新 → 返回最新数据
+func (h *ChannelHandler) Update(c *gin.Context) {
+	// ① id 转整数
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		resp(c, 400, "id 无效", nil)
+		return
+	}
+
+	// ② 先确认要更新的记录存在（更新不存在的资源 → 404）
+	var ch model.Channel
+	if err := h.db.First(&ch, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			resp(c, 404, "渠道不存在", nil)
+		} else {
+			resp(c, 500, "查询失败: "+err.Error(), nil)
+		}
+		return
+	}
+
+	// ③ 解析请求体（传什么更新什么，缺省字段保持原值）
+	var req model.Channel
+	if err := c.ShouldBindJSON(&req); err != nil {
+		resp(c, 400, "参数错误: "+err.Error(), nil)
+		return
+	}
+
+	// ④ 用 map 更新（关键教学点）：
+	//    为什么不用 结构体 更新？因为 GORM 用结构体更新会"忽略零值"——
+	//    比如 weight 传 0、enabled 传 false，会被当成"没传"而跳过更新
+	//    用 map 更新则 0/false 也会真实写入
+	updates := map[string]any{
+		"name":     req.Name,
+		"provider": req.Provider,
+		"base_url": req.BaseURL,
+		"api_key":  req.APIKey,
+		"weight":   req.Weight,
+		"enabled":  req.Enabled,
+	}
+	// Model(&ch)：锁定更新目标是 ch 这张表的 id 行；Updates 只更新给定字段
+	if err := h.db.Model(&ch).Updates(updates).Error; err != nil {
+		resp(c, 500, "更新失败: "+err.Error(), nil)
+		return
+	}
+
+	// ⑤ 重新查询一次，返回更新后的最新数据（Updates 不会回填结构体）
+	h.db.First(&ch, id)
+	resp(c, 0, "ok", channelView(ch))
+}
+
+// Delete DELETE /api/channels/:id —— 删除渠道
+// 流程：id 转整数 → 确认存在 → 删除 → 返回
+func (h *ChannelHandler) Delete(c *gin.Context) {
+	// ① id 转整数
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		resp(c, 400, "id 无效", nil)
+		return
+	}
+
+	// ② 先确认存在（删除不存在的资源 → 404）
+	var ch model.Channel
+	if err := h.db.First(&ch, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			resp(c, 404, "渠道不存在", nil)
+		} else {
+			resp(c, 500, "查询失败: "+err.Error(), nil)
+		}
+		return
+	}
+
+	// ③ 删除：DELETE FROM channels WHERE id = ?
+	//    （GORM 的 Delete 默认支持软删除——模型里有 DeletedAt 字段才会软删，这里没有 = 物理删除）
+	if err := h.db.Delete(&ch).Error; err != nil {
+		resp(c, 500, "删除失败: "+err.Error(), nil)
+		return
+	}
+	resp(c, 0, "ok", nil) // 删除成功，无数据返回
 }

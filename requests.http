@@ -28,7 +28,29 @@ Content-Type: application/json
   "weight": 2
 }
 
-### 4. AI 网关统一入口（W1 中后段可用）
+### 4. 渠道详情（把 3 换成真实 id）
+GET http://localhost:8080/api/channels/3
+
+### 5. 更新渠道（把 3 换成真实 id；测 0/false 也能更新成功）
+PUT http://localhost:8080/api/channels/4
+Content-Type: application/json
+
+{
+  "name": "DeepSeek 主-改",
+  "provider": "deepseek",
+  "base_url": "https://api.deepseek.com/v1",
+  "api_key": "sk-new-key-999",
+  "weight": 0,
+  "enabled": false
+}
+
+### 6. 删除渠道（把 3 换成真实 id）
+DELETE http://localhost:8080/api/channels/3
+
+### 7. 删除不存在的渠道（应返回 404）
+DELETE http://localhost:8080/api/channels/999
+
+### 8. AI 网关统一入口（W1 中后段可用）
 # POST http://localhost:8080/v1/chat/completions
 # Authorization: Bearer <你的AccessKey>
 # Content-Type: application/json
