@@ -2,9 +2,10 @@
 package handler
 
 import (
-	"bytes"   // 字节缓冲：把读出来的请求体重建成流
-	"io"      // 流操作：读取请求体、复制响应体
-	"log"     // 日志：记录转发链路
+	"bytes"      // 字节缓冲：把读出来的请求体重建成流
+	"io"         // 流操作：读取请求体、复制响应体
+	"log"        // 日志：记录转发链路
+	"math/rand/v2" // 随机数：加权随机选渠道（rand.IntN 是 Go 1.22+ 推荐写法）
 	"net/http"
 	"strings" // 字符串处理：去掉 base_url 末尾多余的 /
 	"time"
@@ -35,6 +36,47 @@ func NewRelayHandler(db *gorm.DB) *RelayHandler {
 	}
 }
 
+// pickChannel 按权重加权随机选一个启用的渠道（W2：调度器雏形）
+//
+// 算法（前缀区间法）：
+//   权重数组 [1, 2, 3] → 总权重 6 → 想象一条分成 1:2:3 三段的刻度尺
+//   生成随机数 n ∈ [0, 6)，落在哪段就选谁：
+//     n=0       → 渠道A（概率 1/6）
+//     n=1,2     → 渠道B（概率 2/6）
+//     n=3,4,5   → 渠道C（概率 3/6）
+//
+// 为什么用加权随机而不是轮询？真实网关里渠道有配额差异（贵的少调、便宜的多调），
+// 权重就是"配额比例"。轮询是"均等分配"，加权随机才是"按比例分配"。
+func (h *RelayHandler) pickChannel() (model.Channel, error) {
+	// ① 查出所有启用的渠道（enabled = true）
+	var list []model.Channel
+	if err := h.db.Where("enabled = ?", true).Find(&list).Error; err != nil {
+		return model.Channel{}, err
+	}
+	if len(list) == 0 {
+		return model.Channel{}, gorm.ErrRecordNotFound // 复用"找不到记录"的错误语义
+	}
+
+	// ② 计算总权重（weight < 1 按 1 算，防止 0 权重渠道永远不会被选中）
+	total := 0
+	for _, ch := range list {
+		if ch.Weight < 1 {
+			ch.Weight = 1
+		}
+		total += ch.Weight
+	}
+
+	// ③ 生成 [0, total) 的随机数，逐段扣减定位区间
+	n := rand.IntN(total) // Go 1.22+ 的推荐写法（旧版是 rand.Intn，已废弃）
+	for _, ch := range list {
+		n -= ch.Weight
+		if n < 0 { // 掉进这个渠道的区间 → 选中它
+			return ch, nil
+		}
+	}
+	return list[len(list)-1], nil // 兜底：理论上不会走到这
+}
+
 // ChatCompletions POST /v1/chat/completions —— 网关统一入口
 //
 // 完整链路（这是 AI 网关的灵魂，面试常问）：
@@ -43,15 +85,16 @@ func NewRelayHandler(db *gorm.DB) *RelayHandler {
 //	             └────── 转发请求 ──────┘
 //	             ←────── 带回响应 ──────┘
 func (h *RelayHandler) ChatCompletions(c *gin.Context) {
-	// ① 选渠道：先取"第一个启用的渠道"（简单版）
-	//    ⚠️ 以后会换成"按权重/健康度调度"（W2 的调度器），这里先跑通链路
+	// ① 选渠道（W2 升级）：按权重加权随机选一个启用渠道
+	//    W3 会进一步叠加"健康度"（故障转移：挂了的上游自动降权/剔除）
 	var ch model.Channel
-	if err := h.db.Where("enabled = ?", true).First(&ch).Error; err != nil {
+	ch, err := h.pickChannel()
+	if err != nil {
 		// 503 Service Unavailable：服务不可用（不是调用方的问题，是"没渠道可转发"）
 		resp(c, 503, "无可用渠道", nil)
 		return
 	}
-	log.Printf("[relay] 选中渠道 id=%d name=%s → %s", ch.ID, ch.Name, ch.BaseURL)
+	log.Printf("[relay] 加权选中渠道 id=%d name=%s weight=%d → %s", ch.ID, ch.Name, ch.Weight, ch.BaseURL)
 
 	// ② 读出客户端的请求体
 	//    ⚠️ body 是"流"：只能读一次。这里读出来，后面要重建给上游
