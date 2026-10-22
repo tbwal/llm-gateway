@@ -15,14 +15,14 @@ func main() {
 	cfg := config.Load()
 
 	// ② 初始化数据库：打开 SQLite + 自动建表
-	// 第 2 步先只确认"数据库能开、表能建"；第 3 步开始把 db 传给业务层使用
-	_, err := storage.InitDB(cfg.DBPath)
+	// 第 3 步起：db 句柄交给路由层 → 注入业务处理器使用
+	db, err := storage.InitDB(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 
-	// ③ 创建 gin 引擎并注册路由（目前只有 /health）
-	r := router.New()
+	// ③ 创建 gin 引擎并注册路由（把 db 传给路由层做依赖注入）
+	r := router.New(db)
 
 	// ④ 启动 HTTP 服务并监听端口（阻塞运行）
 	log.Printf("AI 网关启动: http://localhost:%s", cfg.Port)

@@ -14,9 +14,11 @@ type Channel struct {
 	Name      string    `gorm:"size:100;not null" json:"name"`        // 渠道名（如 "DeepSeek 主"）
 	Provider  string    `gorm:"size:50;not null" json:"provider"`     // 上游类型：openai / anthropic / deepseek
 	BaseURL   string    `gorm:"size:255" json:"base_url"`             // 上游地址（如 https://api.deepseek.com/v1）
-	APIKey    string    `gorm:"size:255" json:"-"`                    // 上游密钥
-	// ⚠️ json:"-" 表示：接口返回时永远隐藏这个字段（密钥绝不外泄）
-	// 第 3 步会把它升级成 AES-GCM 加密后再落库
+	// APIKey 上游密钥（如 sk-xxx）
+	// 注意：这里不能用 json:"-" —— 它会"双向屏蔽"：既不让密钥出现在响应里，
+	// 也会阻止请求体里的 api_key 被解析（导致创建时存空串）
+	// 正确做法：模型层允许进出，响应层手动把关（见 handler 的 channelView）
+	APIKey    string    `gorm:"size:255" json:"api_key"`
 	Weight    int       `gorm:"default:1" json:"weight"`              // 调度权重（权重越高被选中概率越大）
 	Enabled   bool      `gorm:"default:true" json:"enabled"`          // 是否启用（停用后调度不选它）
 	CreatedAt time.Time `json:"created_at"`                           // 创建时间（GORM 自动填）

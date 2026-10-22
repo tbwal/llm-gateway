@@ -1,24 +1,34 @@
 ### 0. 健康检查（服务是否存活）
 GET http://localhost:8080/health
 
-### ========== 后续接口在这里逐步追加 ==========
+### 1. 创建渠道
+POST http://localhost:8080/api/channels
+Content-Type: application/json
 
-### 1. 创建渠道（第 3 步后可用）
-# POST http://localhost:8080/api/channels
-# Content-Type: application/json
-#
-# {
-#   "name": "DeepSeek 主",
-#   "provider": "openai",
-#   "base_url": "http://localhost:9090/v1",
-#   "api_key": "sk-test-123",
-#   "weight": 1
-# }
+{
+  "name": "DeepSeek 主",
+  "provider": "deepseek",
+  "base_url": "https://api.deepseek.com/v1",
+  "api_key": "sk-test-123",
+  "weight": 1
+}
 
 ### 2. 渠道列表
-# GET http://localhost:8080/api/channels
+GET http://localhost:8080/api/channels
 
-### 3. AI 网关统一入口（W1 中后段可用）
+### 3. 创建第二个渠道（测多条 + 中文）
+POST http://localhost:8080/api/channels
+Content-Type: application/json
+
+{
+  "name": "OpenAI 备用",
+  "provider": "openai",
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "sk-test-456",
+  "weight": 2
+}
+
+### 4. AI 网关统一入口（W1 中后段可用）
 # POST http://localhost:8080/v1/chat/completions
 # Authorization: Bearer <你的AccessKey>
 # Content-Type: application/json
