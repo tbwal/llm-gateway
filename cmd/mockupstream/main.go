@@ -15,19 +15,54 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
+
+// mockFail 全局故障开关：true 时所有接口返回 503（用于验证网关熔断与健康探测）
+var mockFail atomic.Bool
 
 func main() {
 	// 注册处理器：OpenAI 兼容的聊天补全接口 + Anthropic Messages API
 	http.HandleFunc("/v1/chat/completions", handleChat)
 	http.HandleFunc("/v1/messages", handleMessages) // 模拟 Claude：协议转换的本地验证目标
+	http.HandleFunc("/health", handleHealth)        // 健康探测端点（网关熔断恢复用）
+	http.HandleFunc("/debug/fail", handleFailToggle) // 故障开关控制（验证熔断用）
 	log.Println("mock 上游已启动: http://localhost:9090")
 	log.Fatal(http.ListenAndServe(":9090", nil)) // 阻塞监听，Ctrl+C 退出
 }
 
+// handleHealth 健康探测端点：网关的后台探测器定期 GET 这里，确认渠道上游是否存活
+// 正常 → 200；故障模式 → 503（让探测失败，渠道保持熔断）
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	if mockFail.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("mock fail mode\n"))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok\n"))
+}
+
+// handleFailToggle 故障开关控制端点：POST {"on":true/false}
+// 验证熔断的用法：开 → 网关所有渠道连续失败 → 熔断摘除 → 关 → 探活恢复
+func handleFailToggle(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		On bool `json:"on"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	mockFail.Store(req.On)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, "{\"mock_fail\":%v}\n", req.On)
+}
+
 // handleChat 统一入口：先看客户端要流式还是普通返回，再分发
 func handleChat(w http.ResponseWriter, r *http.Request) {
+	// 故障模式检查：开启时全部返回 503（模拟渠道大面积故障，触发网关熔断）
+	if mockFail.Load() {
+		http.Error(w, "mock 故障模式", http.StatusServiceUnavailable)
+		return
+	}
 	// ① 读取请求体（真实上游会在这里解析消息并调用大模型）
 	body, _ := io.ReadAll(r.Body)
 	log.Printf("mock 收到请求: %s", body)
@@ -128,6 +163,11 @@ func handleStream(w http.ResponseWriter) {
 
 // handleMessages Anthropic Messages API 统一入口：按 stream 字段分发
 func handleMessages(w http.ResponseWriter, r *http.Request) {
+	// 故障模式检查：与 OpenAI 端点一致，统一模拟上游故障
+	if mockFail.Load() {
+		http.Error(w, "mock 故障模式", http.StatusServiceUnavailable)
+		return
+	}
 	// ① 读取请求体（真实 Claude 在这里解析消息并调用大模型）
 	body, _ := io.ReadAll(r.Body)
 	log.Printf("mock(Anthropic) 收到请求: %s", body)

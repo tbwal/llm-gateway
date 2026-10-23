@@ -5,6 +5,7 @@ package router
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -41,6 +42,10 @@ func New(db *gorm.DB, enc crypto.Service) *gin.Engine {
 	// 客户端只调这一个接口，背后转发到哪个渠道由网关决定
 	relay := handler.NewRelayHandler(db, enc)
 	r.POST("/v1/chat/completions", relay.ChatCompletions)
+
+	// 后台健康探测（W2 熔断配套）：每 15 秒扫描熔断渠道，探活成功自动恢复
+	prober := handler.NewHealthProber(db, relay.Breakers(), 15*time.Second)
+	prober.Start()
 
 	return r
 }

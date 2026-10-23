@@ -129,3 +129,48 @@ Content-Type: application/json
   "messages": [{"role": "user", "content": "hi"}],
   "stream": true
 }
+
+
+
+
+# 故障测试（熔断与健康探测验证）
+### [CB-0] 前置确认：服务正常
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+
+{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+
+
+
+
+### [CB-1] 开启 mock 故障模式（所有接口返回 503）
+POST http://localhost:9090/debug/fail
+Content-Type: application/json
+
+{"on": true}
+
+### [CB-2] 连发 10 次请求（让渠道连续失败触发熔断；失败的 502/503 是预期）
+# 预期：前几次 502（网关尝试多个渠道都失败），
+#       中途某个渠道连续失败 3 次被熔断摘除（日志里不再尝试它），
+#       最后全部熔断 → 响应"所有渠道均不可用"
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+
+{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+
+
+
+
+### [CB-3] 关闭 mock 故障模式
+POST http://localhost:9090/debug/fail
+Content-Type: application/json
+
+{"on": false}
+
+### [CB-4] 等 15~30 秒（健康探测周期 15s）后，恢复正常
+# 预期：server 日志出现 "[probe] 渠道 id=X 探活成功 → 恢复调度"，
+#       本请求恢复 200 正常返回
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+
+{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}

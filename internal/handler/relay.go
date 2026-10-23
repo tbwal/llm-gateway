@@ -29,17 +29,24 @@ type RelayHandler struct {
 	db     *gorm.DB     // 数据库：查渠道配置
 	client *http.Client // 转发专用的 HTTP 客户端（带超时，防止上游拖死我们）
 	enc    crypto.Service // 加密服务：渠道 API Key 从库里取出来是密文，转发前先解密
+	breakers *circuitBreakers // 熔断器注册表：跨请求统计渠道连续失败，自动摘除/恢复
 }
 
-// NewRelayHandler 构造器：注入 db 和加密服务，创建带超时的转发客户端
+// NewRelayHandler 构造器：注入 db 和加密服务，创建带超时的转发客户端和熔断器
 func NewRelayHandler(db *gorm.DB, enc crypto.Service) *RelayHandler {
 	return &RelayHandler{
 		db: db,
 		client: &http.Client{
 			Timeout: 30 * time.Second, // 30 秒没收到上游响应就放弃
 		},
-		enc: enc,
+		enc:      enc,
+		breakers: newCircuitBreakers(),
 	}
+}
+
+// Breakers 暴露熔断器注册表（供后台健康探测扫描 OPEN 渠道）
+func (h *RelayHandler) Breakers() *circuitBreakers {
+	return h.breakers
 }
 
 // pickChannel 按权重加权随机选一个启用的渠道（W2 调度 + W3 排除已试）
@@ -60,7 +67,8 @@ func (h *RelayHandler) pickChannel(excluded map[uint]struct{}, modelName string)
 		return model.Channel{}, err
 	}
 
-	// ② 两层过滤：已试失败排除 + 按模型路由（只留"支持该模型"的候选）
+	// ② 三层过滤：已试失败排除 + 按模型路由 + 熔断状态
+	//    （熔断：连续失败 N 次的渠道被摘除，冷却期/探活恢复后才重新入池）
 	candidates := make([]model.Channel, 0, len(list))
 	for _, ch := range list {
 		if _, tried := excluded[ch.ID]; tried { // 这个渠道已经试过且失败 → 排除
@@ -69,6 +77,10 @@ func (h *RelayHandler) pickChannel(excluded map[uint]struct{}, modelName string)
 		// 路由层：渠道声明了 models 列表，但客户端请求的模型不在其中 → 不参与调度
 		// （渠道 models 为空 = 支持所有模型，兼容旧渠道无需迁移）
 		if modelName != "" && ch.Models != "" && !containsModel(ch.Models, modelName) {
+			continue
+		}
+		// 熔断层：OPEN（冷却中）或 HALF_OPEN（探测已放行）→ 跳过
+		if !h.breakers.allow(ch.ID, time.Now()) {
 			continue
 		}
 		if ch.Weight < 1 { // 防止 0 权重渠道永远不会被选中
@@ -483,6 +495,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		if err != nil {
 			log.Printf("[relay] 渠道 id=%d 密钥解密失败: %v，尝试下一个", ch.ID, err)
 			tried[ch.ID] = struct{}{}
+			h.breakers.recordFailure(ch.ID, time.Now()) // 密钥坏了也算渠道故障，累计熔断
 			continue
 		}
 
@@ -518,18 +531,20 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		// 发出请求（阻塞等上游响应）
 		upResp, err := h.client.Do(req)
 		if err != nil {
-			// 网络层失败（连不上/超时）→ 记入已试，换下一个渠道
+			// 网络层失败（连不上/超时）→ 记入已试 + 熔断计数，换下一个渠道
 			log.Printf("[relay] 渠道 id=%d 网络失败: %v，尝试下一个", ch.ID, err)
 			tried[ch.ID] = struct{}{}
+			h.breakers.recordFailure(ch.ID, time.Now())
 			continue
 		}
 
 		// 上游给了明确响应，按状态码分流：
 		if upResp.StatusCode >= 500 {
-			// 5xx = 上游服务器故障 → 值得换渠道重试
+			// 5xx = 上游服务器故障 → 值得换渠道重试；同时累计熔断计数
 			log.Printf("[relay] 渠道 id=%d 返回 %d，尝试下一个", ch.ID, upResp.StatusCode)
 			upResp.Body.Close() // 显式关闭，释放连接（不用 defer——循环里会累积）
 			tried[ch.ID] = struct{}{}
+			h.breakers.recordFailure(ch.ID, time.Now())
 			continue
 		}
 
@@ -538,6 +553,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		//   换任何渠道结果都一样，重试纯属浪费
 		//   ⚠️ 从此处起渠道已锁定：响应开始流向客户端，故障转移到此为止
 		defer upResp.Body.Close()
+		h.breakers.recordSuccess(ch.ID) // 拿到响应 = 渠道是通的，记成功清失败计数
 		log.Printf("[relay] 渠道 id=%d 返回 %d，锁定并透传", ch.ID, upResp.StatusCode)
 
 		// 把上游的响应搬回给客户端，按类型分流：
