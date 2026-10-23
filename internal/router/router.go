@@ -61,6 +61,18 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 	relay := handler.NewRelayHandler(db, enc, cache, limiter)
 	r.POST("/v1/chat/completions", relay.ChatCompletions)
 
+	// 用量看板 API（W3-③）：基于 usage_logs 流水表查询时聚合
+	//   GET /api/usage/summary   总览卡片
+	//   GET /api/usage/breakdown 分组排行（?group=model|channel）
+	//   GET /api/usage/daily     按天趋势
+	dash := handler.NewUsageDashboard(db)
+	ug := r.Group("/api/usage")
+	{
+		ug.GET("/summary", dash.Summary)
+		ug.GET("/breakdown", dash.Breakdown)
+		ug.GET("/daily", dash.Daily)
+	}
+
 	// 后台健康探测（W2 熔断配套）：每 15 秒扫描熔断渠道，探活成功自动恢复
 	prober := handler.NewHealthProber(db, relay.Breakers(), 15*time.Second)
 	prober.Start()
