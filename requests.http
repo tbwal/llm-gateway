@@ -47,7 +47,7 @@ Content-Type: application/json
 }
 
 ### 6. 删除渠道（把 3 换成真实 id）
-DELETE http://localhost:8080/api/channels/3
+DELETE http://localhost:8080/api/channels/5
 
 ### 7. 删除不存在的渠道（应返回 404）
 DELETE http://localhost:8080/api/channels/999
@@ -216,7 +216,7 @@ X-User-Key: test-user-001
 POST http://localhost:8080/v1/chat/completions
 Content-Type: application/json
 
-{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+{"model": "claude-3-5-sonnet", "messages": [{"role": "user", "content": "hi"}], "stream": false}
 
 
 

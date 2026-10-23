@@ -43,15 +43,15 @@ func resp(c *gin.Context, code int, msg string, data any) {
 //	响应层在这里手动过滤（对外层不暴露）。这叫"模型与视图分离"。
 func channelView(ch model.Channel) gin.H {
 	return gin.H{
-		"id":         ch.ID,
-		"name":       ch.Name,
-		"provider":   ch.Provider,
-		"base_url":   ch.BaseURL,
-		"weight":     ch.Weight,
-		"enabled":    ch.Enabled,
-		"models":     ch.Models,
-		"created_at": ch.CreatedAt,
-		// 没有 api_key —— 对外永远看不到密钥
+		"id":          ch.ID,
+		"name":        ch.Name,
+		"provider":    ch.Provider,
+		"base_url":    ch.BaseURL,
+		"weight":      ch.Weight,
+		"enabled":     ch.Enabled,
+		"models":      ch.Models,
+		"api_key_set": ch.APIKey != "", // 是否已配置密钥（只给布尔，绝不泄露密钥本身）
+		"created_at":  ch.CreatedAt,
 	}
 }
 

@@ -9,3 +9,9 @@ dist/
 
 # 日志
 *.log
+*.md
+
+# 前端依赖与临时目录（web/ 下 npm install 生成，clone 后 npm install 即可重建）
+node_modules/
+.esbuild-tmp/
+web_dist/
