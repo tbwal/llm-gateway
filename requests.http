@@ -174,3 +174,44 @@ POST http://localhost:8080/v1/chat/completions
 Content-Type: application/json
 
 {"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+
+
+
+
+
+
+
+
+### [限流-1] 第 1 次（预期 200）
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+X-User-Key: test-user-001
+
+{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+
+### [限流-2] 第 2 次（预期 200）
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+X-User-Key: test-user-001
+
+{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+
+### [限流-3] 第 3 次（预期 200）
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+X-User-Key: test-user-001
+
+{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+
+### [限流-4] 第 4 次（预期 429）
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+X-User-Key: test-user-001
+
+{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+
+### [W3-①-2] 无头请求：走 IP 兜底（本地共享 127.0.0.1 额度）
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+
+{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}

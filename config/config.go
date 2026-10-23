@@ -2,7 +2,10 @@
 // 第 1 步只管理端口，后续在这里扩展数据库/Redis/AES 密钥等配置
 package config
 
-import "os"
+import (
+	"os"
+	"strconv"
+)
 
 // Config 服务配置结构体
 type Config struct {
@@ -11,6 +14,16 @@ type Config struct {
 	// SecretKey 渠道 API Key 的加密密钥（环境变量 LLM_GATEWAY_SECRET_KEY，64 位 hex）
 	// 未设置时返回空串，由 crypto.NewService 回退到开发默认密钥（仅限本地开发）
 	SecretKey string
+
+	// ── W3 限流配置 ──
+	// RateLimitEnabled 是否开启限流（默认开：本地用 memory，生产切 redis）
+	// RateLimitPerMin 每调用方每分钟最大请求数（滑动窗口；调小可验证 429）
+	// RateLimitStore  限流存储：memory（默认，单机）| redis（多实例共享）
+	// RedisAddr       Redis 地址（store=redis 时使用）
+	RateLimitEnabled bool
+	RateLimitPerMin  int
+	RateLimitStore   string
+	RedisAddr        string
 }
 
 // Load 从环境变量读取配置，未设置时使用默认值
@@ -37,5 +50,33 @@ func Load() Config {
 	// LLM_GATEWAY_SECRET_KEY：渠道 API Key 的 AES 加密密钥
 	// 生产环境必须设置；留空则由 crypto.NewService 使用开发默认密钥（并打警告日志）
 	secretKey := os.Getenv("LLM_GATEWAY_SECRET_KEY")
-	return Config{Port: port, DBPath: dbPath, SecretKey: secretKey}
+
+	// ── W3 限流配置（RATE_LIMIT_* 环境变量）──
+	// 默认开启 + memory 存储：本地零依赖跑通全流程；
+	// 生产设置 RATE_LIMIT_STORE=redis + REDIS_ADDR 即切换为分布式限流
+	rateLimitEnabled := os.Getenv("RATE_LIMIT_ENABLED") != "false" // 默认开，显式 "false" 才关
+	rateLimitPerMin := 60                                          // 默认每调用方 60 次/分钟
+	if v := os.Getenv("RATE_LIMIT_PER_MIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			rateLimitPerMin = n
+		}
+	}
+	rateLimitStore := os.Getenv("RATE_LIMIT_STORE")
+	if rateLimitStore == "" {
+		rateLimitStore = "memory"
+	}
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+
+	return Config{
+		Port:              port,
+		DBPath:            dbPath,
+		SecretKey:         secretKey,
+		RateLimitEnabled:  rateLimitEnabled,
+		RateLimitPerMin:   rateLimitPerMin,
+		RateLimitStore:    rateLimitStore,
+		RedisAddr:         redisAddr,
+	}
 }

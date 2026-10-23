@@ -39,8 +39,8 @@ func main() {
 		log.Fatalf("加密服务初始化失败: %v", err)
 	}
 
-	// ④ 创建 gin 引擎并注册路由（把 db 和加密服务传给路由层做依赖注入）
-	r := router.New(db, enc)
+	// ④ 创建 gin 引擎并注册路由（把 db、加密服务、配置传给路由层做依赖注入）
+	r := router.New(db, enc, cfg)
 
 	// ⑤ 启动 HTTP 服务并监听端口（阻塞运行）
 	log.Printf("AI 网关启动: http://localhost:%s", cfg.Port)

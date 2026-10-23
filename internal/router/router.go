@@ -5,20 +5,23 @@
 package router
 
 import (
+	"log"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"llm-gateway/config"
 	"llm-gateway/internal/crypto"
 	"llm-gateway/internal/handler"
+	"llm-gateway/internal/ratelimit"
 )
 
 // New 创建 gin 引擎并注册全部路由
-// 参数 db：数据库句柄；enc：加密服务（API Key 落库加密/转发解密）
-// 路由层把两者注入给业务处理器（依赖往下传递）
-func New(db *gorm.DB, enc crypto.Service) *gin.Engine {
+// 参数 db：数据库句柄；enc：加密服务（API Key 落库加密/转发解密）；cfg：服务配置
+// 路由层把依赖注入给业务处理器（依赖往下传递）
+func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 	// gin.Default()：自带日志中间件 + panic 恢复中间件
 	r := gin.Default()
 
@@ -45,7 +48,17 @@ func New(db *gorm.DB, enc crypto.Service) *gin.Engine {
 
 	// AI 网关统一入口（第 4 步：转发）
 	// 客户端只调这一个接口，背后转发到哪个渠道由网关决定
-	relay := handler.NewRelayHandler(db, enc, cache)
+	var limiter ratelimit.Limiter
+	if cfg.RateLimitEnabled {
+		l, err := ratelimit.New(cfg.RateLimitStore, cfg.RateLimitPerMin, time.Minute, cfg.RedisAddr)
+		if err != nil {
+			log.Printf("⚠️ 限流器初始化失败，本次启动限流关闭: %v", err)
+		} else {
+			limiter = l
+			log.Printf("限流已开启: store=%s limit=%d/分钟", cfg.RateLimitStore, cfg.RateLimitPerMin)
+		}
+	}
+	relay := handler.NewRelayHandler(db, enc, cache, limiter)
 	r.POST("/v1/chat/completions", relay.ChatCompletions)
 
 	// 后台健康探测（W2 熔断配套）：每 15 秒扫描熔断渠道，探活成功自动恢复

@@ -19,6 +19,7 @@ import (
 
 	"llm-gateway/internal/crypto"
 	"llm-gateway/internal/model"
+	"llm-gateway/internal/ratelimit"
 )
 
 // RelayHandler AI 网关转发处理器（第 4 步：简单"一键中转"）
@@ -32,10 +33,11 @@ type RelayHandler struct {
 	client *http.Client // 转发专用的 HTTP 客户端（连接池 + 分层超时）
 	enc    crypto.Service // 加密服务：渠道 API Key 从库里取出来是密文，转发前先解密
 	breakers *circuitBreakers // 熔断器注册表：跨请求统计渠道连续失败，自动摘除/恢复
+	limiter  ratelimit.Limiter // W3 限流器：滑动窗口（memory 本地 / redis 分布式）
 }
 
-// NewRelayHandler 构造器：注入 db、加密服务、渠道缓存；创建连接池调优的转发客户端和熔断器
-func NewRelayHandler(db *gorm.DB, enc crypto.Service, cache *channelCache) *RelayHandler {
+// NewRelayHandler 构造器：注入 db、加密服务、渠道缓存、限流器；创建连接池调优的转发客户端和熔断器
+func NewRelayHandler(db *gorm.DB, enc crypto.Service, cache *channelCache, limiter ratelimit.Limiter) *RelayHandler {
 	// 连接池调优（W2 连接池/热更新：连接侧）
 	// 默认 http.DefaultTransport 的 MaxIdleConnsPerHost=2——
 	// 高并发转发时并发连接无法复用，每请求重建 TCP 连接（慢 + 耗资源）。
@@ -64,12 +66,27 @@ func NewRelayHandler(db *gorm.DB, enc crypto.Service, cache *channelCache) *Rela
 		},
 		enc:      enc,
 		breakers: newCircuitBreakers(),
+		limiter:  limiter,
 	}
 }
 
 // Breakers 暴露熔断器注册表（供后台健康探测扫描 OPEN 渠道）
 func (h *RelayHandler) Breakers() *circuitBreakers {
 	return h.breakers
+}
+
+// rateLimitKey 提取限流的"调用方标识"
+// 优先级：Authorization: Bearer <key> → X-User-Key → 客户端 IP（兜底）
+// 真实网关里这里是 AccessKey/团队 ID（鉴权后取），本网关暂未做鉴权，
+// 用调用方自报的标识做限流维度（面试讲：接入鉴权后替换为可信身份即可）
+func (h *RelayHandler) rateLimitKey(c *gin.Context) string {
+	if auth := c.GetHeader("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		return "user:" + strings.TrimPrefix(auth, "Bearer ")
+	}
+	if k := c.GetHeader("X-User-Key"); k != "" {
+		return "user:" + k
+	}
+	return "ip:" + c.ClientIP()
 }
 
 // pickChannel 按权重加权随机选一个启用的渠道（W2 调度 + W3 排除已试）
@@ -458,6 +475,21 @@ func flushWriter(c *gin.Context) {
 //	             └────── 转发请求 ──────┘
 //	             ←────── 带回响应 ──────┘
 func (h *RelayHandler) ChatCompletions(c *gin.Context) {
+	// ⓪ W3 限流：在解析 body 之前先掐住（省得为被拒绝的请求白做 JSON 解析）
+	// key 取调用方标识（Authorization Bearer / X-User-Key），兜底客户端 IP
+	if h.limiter != nil {
+		key := h.rateLimitKey(c)
+		ok, err := h.limiter.Allow(key)
+		if err != nil {
+			// fail-open：限流器自身故障（如 Redis 连不上）时放行，
+			// 保证"限流组件挂了"不会拖垮整个网关（可用性优先），但记日志可观测
+			log.Printf("[ratelimit] 限流器故障，fail-open 放行（key=%s）: %v", key, err)
+		} else if !ok {
+			resp(c, 429, "请求过于频繁，请稍后再试（滑动窗口内已达上限）", nil)
+			return
+		}
+	}
+
 	// ① 读出客户端的请求体（只读一次，各次重试复用同一份 body）
 	//    ⚠️ body 是"流"：只能读一次。这里读出来，后面要重建给每个候选上游
 	body, err := io.ReadAll(c.Request.Body)
