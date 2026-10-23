@@ -20,6 +20,7 @@ import (
 	"llm-gateway/internal/crypto"
 	"llm-gateway/internal/model"
 	"llm-gateway/internal/ratelimit"
+	"llm-gateway/internal/usage"
 )
 
 // RelayHandler AI 网关转发处理器（第 4 步：简单"一键中转"）
@@ -87,6 +88,35 @@ func (h *RelayHandler) rateLimitKey(c *gin.Context) string {
 		return "user:" + k
 	}
 	return "ip:" + c.ClientIP()
+}
+
+// recordUsage W3-② 计费落库：把一次请求的 token 用量写成流水
+//
+// 设计原则（面试讲点）：**流水表 + 查询时聚合**
+//   - 每次请求 INSERT 一条（只增不减，可审计）
+//   - 聚合（SUM / 按渠道 / 按模型 / 按天）由用量看板查询时算
+//   - 不维护"每渠道一个计数行 + 每请求 UPDATE"：那是热点行锁，
+//     所有请求抢同一行写锁，并发越高越慢；INSERT 流水没有锁竞争
+func (h *RelayHandler) recordUsage(ch model.Channel, modelName string, promptTokens, completionTokens int) {
+	if promptTokens == 0 && completionTokens == 0 {
+		return // 什么都拿不到就不记（避免一堆 0 流水）
+	}
+	cost := usage.CalcCost(modelName, promptTokens, completionTokens)
+	logEntry := model.UsageLog{
+		ChannelID:        ch.ID,
+		ChannelName:      ch.Name,
+		Provider:         ch.Provider,
+		Model:            modelName,
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+		Cost:             cost,
+	}
+	if err := h.db.Create(&logEntry).Error; err != nil {
+		log.Printf("[usage] 计费落库失败: %v", err)
+		return
+	}
+	log.Printf("[usage] 渠道 id=%d model=%s tokens=%d+%d cost=%.4f元", ch.ID, modelName, promptTokens, completionTokens, cost)
 }
 
 // pickChannel 按权重加权随机选一个启用的渠道（W2 调度 + W3 排除已试）
@@ -360,12 +390,12 @@ func (c *sseChunk) render() []byte {
 	return append([]byte("data: "), append(b, '\n', '\n')...)
 }
 
-// handleSSEEvent 处理一条完整 SSE 事件（已按空行切好）：
-// 提取 data 行 → [DONE] 透传 → 解析 → 增量重组 → 写回 + Flush
 // handleSSEEvent 处理一条完整 SSE 事件（已攒到空行）
-// 返回值 done=true 表示"已向客户端发出 [DONE] 收尾标记"
-// （forwardSSE 靠它判断要不要在 EOF 时补发 [DONE]：Anthropic 上游没有 [DONE]）
-func handleSSEEvent(c *gin.Context, event []byte) (bool, error) {
+// 返回值：
+//   chunk    解析出的增量（W3-② 计费用：累计 content / 捕获 usage；无增量事件为 nil）
+//   done     是否已向客户端发出 [DONE] 收尾标记
+//            （forwardSSE 靠它判断要不要在 EOF 时补发 [DONE]：Anthropic 上游没有 [DONE]）
+func handleSSEEvent(c *gin.Context, event []byte) (*sseChunk, bool, error) {
 	// ① 提取事件里所有 data: 行（SSE 规范：多条 data 用 \n 连接；忽略 event:/id:/retry:）
 	lines := strings.Split(string(event), "\n")
 	var datas []string
@@ -376,61 +406,75 @@ func handleSSEEvent(c *gin.Context, event []byte) (bool, error) {
 		}
 	}
 	if len(datas) == 0 {
-		return false, nil // 纯注释/心跳行，忽略
+		return nil, false, nil // 纯注释/心跳行，忽略
 	}
 	data := strings.Join(datas, "\n")
 
 	// ② 结束标记 [DONE]：原样透传，这是 OpenAI 流结束的约定
 	if data == "[DONE]" {
 		if _, err := io.WriteString(c.Writer, "data: [DONE]\n\n"); err != nil {
-			return false, err
+			return nil, false, err
 		}
 		flushWriter(c)
-		return true, nil
+		return nil, true, nil
 	}
 
 	// ③ 解析成结构化增量；解析失败（非 JSON 的 data）→ 容错原样透传，不打断流
 	chunk, err := parseSSEChunk(data)
 	if err != nil {
 		if _, werr := c.Writer.Write(event); werr != nil {
-			return false, werr
+			return nil, false, werr
 		}
 		flushWriter(c)
-		return false, nil
+		return nil, false, nil
 	}
 
 	// ④ 无增量事件直接跳过：Anthropic 的 message_start / content_block_start /
 	//    content_block_stop / message_stop 不产生任何内容，不透传给客户端
+	//    （chunk 仍返回给调用方：usage 等元数据可能藏在无增量事件里）
 	if chunk.content == "" && chunk.finishReason == "" && chunk.usage == nil {
-		return false, nil
+		return chunk, false, nil
 	}
 
 	// ⑤ 增量转换：按 OpenAI 格式重组写回 + 立即 Flush（保打字机效果）
 	if _, err := c.Writer.Write(chunk.render()); err != nil {
-		return false, err // 客户端断连会在这里报错 → 上游 context 随之取消
+		return chunk, false, err // 客户端断连会在这里报错 → 上游 context 随之取消
 	}
 	flushWriter(c)
-	return false, nil
+	return chunk, false, nil
 }
 
 // forwardSSE 逐事件消费上游 SSE 流，边收边转边推
 //
 // 核心：按行读、按空行切事件、攒够一条处理一条。
 // ReadBytes('\n') 天然处理"一条事件被拆成多个网络包"——没读到 \n 就一直攒着。
-func forwardSSE(c *gin.Context, upResp *http.Response) error {
+//
+// 返回值（W3-② 计费用）：
+//   content 累计的全部增量文本（usage 缺失时按它估算 completion tokens）
+//   usage   流末尾 usage 事件的真实用量（可能为 nil：上游没返回 usage）
+//   error   转发过程中的错误
+func forwardSSE(c *gin.Context, upResp *http.Response) (string, *sseUsage, error) {
 	reader := bufio.NewReader(upResp.Body)
-	var event []byte // 当前事件的缓冲（跨块攒）
-	sentDone := false // 是否已向客户端发过 [DONE]（OpenAI 上游自带；Anthropic 上游没有，EOF 时补）
+	var event []byte   // 当前事件的缓冲（跨块攒）
+	sentDone := false  // 是否已向客户端发过 [DONE]（OpenAI 上游自带；Anthropic 上游没有，EOF 时补）
+	var content strings.Builder // 累计增量文本（计费估算兜底）
+	var usage *sseUsage         // 捕获流末尾的 usage 事件（一般只有一条）
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			event = append(event, line...)
 			if len(bytes.TrimSpace(line)) == 0 { // 空行 = SSE 事件分隔符
-				done, herr := handleSSEEvent(c, event)
+				chunk, done, herr := handleSSEEvent(c, event)
 				if herr != nil {
-					return herr
+					return content.String(), usage, herr
 				}
 				sentDone = sentDone || done
+				if chunk != nil { // 累计增量 + 捕获 usage（chunk 可能为空：无增量事件）
+					content.WriteString(chunk.content)
+					if chunk.usage != nil {
+						usage = chunk.usage
+					}
+				}
 				event = event[:0] // 清空缓冲，等下一条
 			}
 		}
@@ -438,26 +482,32 @@ func forwardSSE(c *gin.Context, upResp *http.Response) error {
 			if errors.Is(err, io.EOF) {
 				break // 上游流正常结束
 			}
-			return err
+			return content.String(), usage, err
 		}
 	}
 	// 流被上游截断时，最后可能剩一条没闭合的事件，也处理掉
 	if len(bytes.TrimSpace(event)) > 0 {
-		done, herr := handleSSEEvent(c, event)
+		chunk, done, herr := handleSSEEvent(c, event)
 		if herr != nil {
-			return herr
+			return content.String(), usage, herr
 		}
 		sentDone = sentDone || done
+		if chunk != nil {
+			content.WriteString(chunk.content)
+			if chunk.usage != nil {
+				usage = chunk.usage
+			}
+		}
 	}
 	// 协议补齐：Anthropic 流用 message_stop 结束、没有 [DONE]，
 	// 客户端（OpenAI SDK）等的是 data: [DONE] 收尾 → EOF 时补发一个
 	if !sentDone {
 		if _, err := io.WriteString(c.Writer, "data: [DONE]\n\n"); err != nil {
-			return err
+			return content.String(), usage, err
 		}
 		flushWriter(c)
 	}
-	return nil
+	return content.String(), usage, nil
 }
 
 // flushWriter 把缓冲内容立即推给客户端（打字机效果的来源）
@@ -500,10 +550,25 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 
 	// 解析客户端请求里的 model（路由层依据：按模型匹配候选渠道）
 	// 例：{"model":"claude-3-5-sonnet",...} → 只有声明支持该模型的渠道才进候选池
+	// 同时提取 messages 文本：W3-② 计费用——上游流式响应没返回 usage 时，
+	// 用请求文本估算 prompt tokens 兜底
 	var reqMeta struct {
-		Model string `json:"model"`
+		Model    string `json:"model"`
+		Messages []struct {
+			Content string `json:"content"`
+		} `json:"messages"`
 	}
 	_ = json.Unmarshal(body, &reqMeta)
+
+	// 请求侧估算 prompt tokens（拼所有消息文本；usage 缺失时兜底用）
+	promptTokensEst := 0
+	if len(reqMeta.Messages) > 0 {
+		var sb strings.Builder
+		for _, m := range reqMeta.Messages {
+			sb.WriteString(m.Content)
+		}
+		promptTokensEst = usage.EstimateTokens(sb.String())
+	}
 
 	// ② 故障转移循环（W3 核心）：
 	//    选渠道 → 转发 → 失败（网络错误/5xx）→ 记录已试 → 换下一个
@@ -621,21 +686,83 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 
 		if strings.Contains(upResp.Header.Get("Content-Type"), "text/event-stream") {
 			log.Printf("[relay] 渠道 id=%d SSE 流式响应，进入增量转换", ch.ID)
-			if err := forwardSSE(c, upResp); err != nil {
+			content, usageInfo, ferr := forwardSSE(c, upResp)
+			if ferr != nil {
 				// 客户端断连 / 上游异常中断：记录但不再切换渠道（响应已锁定）
-				log.Printf("[relay] 渠道 id=%d SSE 转发中断: %v", ch.ID, err)
+				log.Printf("[relay] 渠道 id=%d SSE 转发中断: %v", ch.ID, ferr)
 			}
+			// W3-② 计费：优先用上游返回的 usage；缺失时估算兜底
+			//   - prompt: 上游 usage 或 请求侧估算
+			//   - completion: 上游 usage 或 累计增量文本估算
+			pt := 0
+			ct := 0
+			if usageInfo != nil {
+				pt, ct = usageInfo.PromptTokens, usageInfo.CompletionTokens
+			}
+			if pt == 0 {
+				pt = promptTokensEst
+			}
+			if ct == 0 {
+				ct = usage.EstimateTokens(content)
+			}
+			h.recordUsage(ch, reqMeta.Model, pt, ct)
 		} else if anthropic {
 			// 非流式 + Anthropic 渠道：响应是 Anthropic 格式（content 数组 + stop_reason），
 			// 客户端（OpenAI SDK）不认——必须转成 OpenAI 格式再写回
 			log.Printf("[relay] 渠道 id=%d 非流式响应，Anthropic → OpenAI 转换", ch.ID)
-			if err := convertAnthropicOnce(c, upResp); err != nil {
-				log.Printf("[relay] 渠道 id=%d 非流式转换失败: %v", ch.ID, err)
+			usageInfo, respText, cerr := convertAnthropicOnce(c, upResp)
+			if cerr != nil {
+				log.Printf("[relay] 渠道 id=%d 非流式转换失败: %v", ch.ID, cerr)
+			} else {
+				// W3-② 计费：Anthropic usage 里 input/output tokens → prompt/completion
+				// usage 缺失时兜底：prompt 用请求估算、completion 用响应文本估算
+				if usageInfo != nil {
+					h.recordUsage(ch, reqMeta.Model, usageInfo.PromptTokens, usageInfo.CompletionTokens)
+				} else {
+					h.recordUsage(ch, reqMeta.Model, promptTokensEst, usage.EstimateTokens(respText))
+				}
 			}
 		} else {
-			// 普通响应：边收边发，不用等全部读完
-			io.Copy(c.Writer, upResp.Body)
-			flushWriter(c) // 收尾 Flush，确保最后一截也立即送达
+			// 普通响应：读完 → 原样写回 → 解析 usage 落账（缺失时按响应文本估算）
+			// ⚠️ 为什么这里改成"读完再写"而不是 io.Copy 边读边写：
+			//    计费需要解析响应体里的 usage；普通 JSON 响应体一般不大，
+			//    读进内存的开销可接受（SSE 才必须流式，这里不流式）
+			respBody, rerr := io.ReadAll(upResp.Body)
+			if rerr != nil {
+				log.Printf("[relay] 渠道 id=%d 读取响应体失败: %v", ch.ID, rerr)
+			} else {
+				if _, werr := c.Writer.Write(respBody); werr != nil {
+					log.Printf("[relay] 渠道 id=%d 写回响应失败: %v", ch.ID, werr)
+				} else {
+					flushWriter(c) // 收尾 Flush，确保最后一截也立即送达
+				}
+				// W3-② 计费：解析 OpenAI usage（prompt_tokens/completion_tokens）
+				// usage 缺失时：completion 按 choices[0].message.content 纯输出文本估算
+				// ⚠️ 不能按整个响应体估算——JSON 骨架（id/object/role/finish_reason 等）
+				//    不是模型输出，会把 completion 高估 2~3 倍；口径必须和流式/Anthropic
+				//    分支一致（估"模型输出的文本"，不估"响应的大小"）
+				var bodyMeta struct {
+					Usage   *sseUsage `json:"usage"`
+					Choices []struct {
+						Message struct {
+							Content string `json:"content"`
+						} `json:"message"`
+					} `json:"choices"`
+				}
+				pt, ct := 0, 0
+				if err := json.Unmarshal(respBody, &bodyMeta); err == nil {
+					if bodyMeta.Usage != nil {
+						pt, ct = bodyMeta.Usage.PromptTokens, bodyMeta.Usage.CompletionTokens
+					}
+					if ct == 0 && len(bodyMeta.Choices) > 0 {
+						ct = usage.EstimateTokens(bodyMeta.Choices[0].Message.Content) // 纯输出文本估算
+					}
+				}
+				if pt == 0 {
+					pt = promptTokensEst
+				}
+				h.recordUsage(ch, reqMeta.Model, pt, ct)
+			}
 		}
 		return
 	}
@@ -648,7 +775,9 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 //               "stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":10}}
 //   OpenAI:    {"id":"...","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"..."},
 //               "finish_reason":"stop"}],"usage":{...}}
-func convertAnthropicOnce(c *gin.Context, upResp *http.Response) error {
+// 返回 *sseUsage（W3-② 计费用：input_tokens/output_tokens → prompt/completion）
+// 和完整响应文本（usage 缺失时按文本估算 completion tokens 兜底）
+func convertAnthropicOnce(c *gin.Context, upResp *http.Response) (*sseUsage, string, error) {
 	var anth struct {
 		ID         string `json:"id"`
 		Model      string `json:"model"`
@@ -663,7 +792,7 @@ func convertAnthropicOnce(c *gin.Context, upResp *http.Response) error {
 		} `json:"usage"`
 	}
 	if err := json.NewDecoder(upResp.Body).Decode(&anth); err != nil {
-		return err
+		return nil, "", err
 	}
 
 	// ① 文本块拼接（Anthropic 的 content 是数组，可能多个 text 块）
@@ -685,12 +814,18 @@ func convertAnthropicOnce(c *gin.Context, upResp *http.Response) error {
 			"finish_reason": mapAnthropicStopReason(anth.StopReason),
 		}},
 	}
+	var usage *sseUsage
 	if anth.Usage.InputTokens > 0 || anth.Usage.OutputTokens > 0 {
+		usage = &sseUsage{
+			PromptTokens:     anth.Usage.InputTokens,
+			CompletionTokens: anth.Usage.OutputTokens,
+			TotalTokens:      anth.Usage.InputTokens + anth.Usage.OutputTokens,
+		}
 		openai["usage"] = map[string]any{
-			"prompt_tokens":     anth.Usage.InputTokens,
-			"completion_tokens": anth.Usage.OutputTokens,
-			"total_tokens":      anth.Usage.InputTokens + anth.Usage.OutputTokens,
+			"prompt_tokens":     usage.PromptTokens,
+			"completion_tokens": usage.CompletionTokens,
+			"total_tokens":      usage.TotalTokens,
 		}
 	}
-	return json.NewEncoder(c.Writer).Encode(openai)
+	return usage, text, json.NewEncoder(c.Writer).Encode(openai)
 }

@@ -215,3 +215,12 @@ POST http://localhost:8080/v1/chat/completions
 Content-Type: application/json
 
 {"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+
+
+
+### [W3-①-2] 测试用量
+POST http://localhost:8080/v1/chat/completions
+Authorization: Bearer sk-test-123
+Content-Type: application/json
+
+{"model":"mock-upstream","messages":[{"role":"user","content":"你好"}],  "stream": true}
