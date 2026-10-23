@@ -1,6 +1,7 @@
 // Package router 路由层：把"HTTP 请求路径"映射到"处理函数"
 // 目前注册：/health、/api/channels（创建+列表）；后续加：
-//   /v1/chat/completions  AI 网关统一入口
+//
+//	/v1/chat/completions  AI 网关统一入口
 package router
 
 import (
@@ -26,9 +27,13 @@ func New(db *gorm.DB, enc crypto.Service) *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
+	// 渠道配置缓存（W2 热更新）：原子快照无锁读；CRUD 主动刷新 + 30s 轮询兜底
+	cache := handler.NewChannelCache(db, 30*time.Second)
+	cache.Start()
+
 	// 渠道管理（第 3 步：完整 CRUD）
-	ch := handler.NewChannelHandler(db, enc) // 依赖注入：把 db 和加密服务传给渠道处理器
-	api := r.Group("/api/channels")     // 路由分组：组内路径自动带 /api/channels 前缀
+	ch := handler.NewChannelHandler(db, enc, cache) // 依赖注入：把 db、加密服务、缓存传给渠道处理器
+	api := r.Group("/api/channels")                 // 路由分组：组内路径自动带 /api/channels 前缀
 	{
 		// 裸花括号：只用于视觉分组，不影响逻辑
 		api.GET("", ch.List)          // 列表：GET /api/channels
@@ -40,7 +45,7 @@ func New(db *gorm.DB, enc crypto.Service) *gin.Engine {
 
 	// AI 网关统一入口（第 4 步：转发）
 	// 客户端只调这一个接口，背后转发到哪个渠道由网关决定
-	relay := handler.NewRelayHandler(db, enc)
+	relay := handler.NewRelayHandler(db, enc, cache)
 	r.POST("/v1/chat/completions", relay.ChatCompletions)
 
 	// 后台健康探测（W2 熔断配套）：每 15 秒扫描熔断渠道，探活成功自动恢复

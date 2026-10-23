@@ -9,6 +9,7 @@ import (
 	"io"           // 流操作：读取请求体、复制响应体
 	"log"          // 日志：记录转发链路
 	"math/rand/v2" // 随机数：加权随机选渠道（rand.IntN 是 Go 1.22+ 推荐写法）
+	"net"          // 连接层：Dialer 超时（连接/KeepAlive 分层超时）
 	"net/http"
 	"strings" // 字符串处理：去掉 base_url 末尾多余的 /、判断 Content-Type
 	"time"
@@ -27,17 +28,39 @@ import (
 // 这个 handler 就是"中转站"的第一个版本。
 type RelayHandler struct {
 	db     *gorm.DB     // 数据库：查渠道配置
-	client *http.Client // 转发专用的 HTTP 客户端（带超时，防止上游拖死我们）
+	cache  *channelCache // 渠道配置缓存（无锁快照读，替代每请求查库）
+	client *http.Client // 转发专用的 HTTP 客户端（连接池 + 分层超时）
 	enc    crypto.Service // 加密服务：渠道 API Key 从库里取出来是密文，转发前先解密
 	breakers *circuitBreakers // 熔断器注册表：跨请求统计渠道连续失败，自动摘除/恢复
 }
 
-// NewRelayHandler 构造器：注入 db 和加密服务，创建带超时的转发客户端和熔断器
-func NewRelayHandler(db *gorm.DB, enc crypto.Service) *RelayHandler {
+// NewRelayHandler 构造器：注入 db、加密服务、渠道缓存；创建连接池调优的转发客户端和熔断器
+func NewRelayHandler(db *gorm.DB, enc crypto.Service, cache *channelCache) *RelayHandler {
+	// 连接池调优（W2 连接池/热更新：连接侧）
+	// 默认 http.DefaultTransport 的 MaxIdleConnsPerHost=2——
+	// 高并发转发时并发连接无法复用，每请求重建 TCP 连接（慢 + 耗资源）。
+	// 这里显式调大空闲连接数，配合分层超时：
+	//   - DialContext.Timeout          连接超时（10s 建不上连接就放弃）
+	//   - ResponseHeaderTimeout        响应头超时（30s 上游还没开始吐就放弃）
+	//   - Client.Timeout=0             不设整体超时（SSE 流式是"无限长"的，
+	//                                   整体超时会掐断已开始的流——上游思考 40s 就断）
+	transport := &http.Transport{
+		MaxIdleConns:          100,               // 全局最大空闲连接
+		MaxIdleConnsPerHost:   10,                // 单上游最大空闲连接（默认 2 → 10）
+		IdleConnTimeout:       90 * time.Second,  // 空闲连接超过 90s 回收
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,  // 等响应头上限（流开始后不限制）
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second, // 连接超时
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
 	return &RelayHandler{
-		db: db,
+		db:   db,
+		cache: cache,
 		client: &http.Client{
-			Timeout: 30 * time.Second, // 30 秒没收到上游响应就放弃
+			Transport: transport,
+			Timeout:   0, // 禁用整体超时（SSE 长流不被掐断）；分层超时已兜住"上游不理我们"
 		},
 		enc:      enc,
 		breakers: newCircuitBreakers(),
@@ -61,11 +84,8 @@ func (h *RelayHandler) Breakers() *circuitBreakers {
 //     n=1,2     → 渠道B（概率 2/6）
 //     n=3,4,5   → 渠道C（概率 3/6）
 func (h *RelayHandler) pickChannel(excluded map[uint]struct{}, modelName string) (model.Channel, error) {
-	// ① 查出所有启用的渠道（enabled = true）
-	var list []model.Channel
-	if err := h.db.Where("enabled = ?", true).Find(&list).Error; err != nil {
-		return model.Channel{}, err
-	}
+	// ① 从内存快照读启用渠道（无锁；替代每请求查库——配置热更新的读路径）
+	list := h.cache.List()
 
 	// ② 三层过滤：已试失败排除 + 按模型路由 + 熔断状态
 	//    （熔断：连续失败 N 次的渠道被摘除，冷却期/探活恢复后才重新入池）

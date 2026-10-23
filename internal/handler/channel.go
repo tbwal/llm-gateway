@@ -20,13 +20,14 @@ import (
 //   - 好处：可测试（换一个 mock 库）、可替换、职责清晰
 //   - enc：API Key 落库前必须加密，绝不明文入库
 type ChannelHandler struct {
-	db  *gorm.DB
-	enc crypto.Service
+	db    *gorm.DB
+	enc   crypto.Service
+	cache *channelCache // 渠道配置缓存：CRUD 后主动刷新，转发侧立即感知（热更新写路径）
 }
 
 // NewChannelHandler 构造器：把数据库依赖注入处理器
-func NewChannelHandler(db *gorm.DB, enc crypto.Service) *ChannelHandler {
-	return &ChannelHandler{db: db, enc: enc}
+func NewChannelHandler(db *gorm.DB, enc crypto.Service, cache *channelCache) *ChannelHandler {
+	return &ChannelHandler{db: db, enc: enc, cache: cache}
 }
 
 // resp 统一响应函数：所有接口同一格式 {code, message, data}
@@ -56,16 +57,46 @@ func channelView(ch model.Channel) gin.H {
 
 // Create POST /api/channels —— 创建渠道
 // 流程：解析请求体 JSON → GORM 写库 → 返回新渠道（含自增 ID，不含密钥）
+// channelReq 创建/更新渠道请求体
+// ⚠️ Enabled 必须用 *bool（指针）：GORM 对带 default 标签的零值字段（false）在 Create 时
+// 会跳过并落数据库默认值 true——用结构体 bool 直接绑，"传 false"会被吞成"没传"。
+// 指针能区分三种状态：nil=没传（保持默认）、false=显式禁用、true=显式启用。
+type channelReq struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	BaseURL  string `json:"base_url"`
+	APIKey   string `json:"api_key"`
+	Weight   int    `json:"weight"`
+	Enabled  *bool  `json:"enabled"`
+	Models   string `json:"models"`
+}
+
+// Create POST /api/channels —— 创建渠道
+// 流程：解析请求体 → 密钥加密 → 写库 → 返回（含渠道 id）
 func (h *ChannelHandler) Create(c *gin.Context) {
-	var ch model.Channel
-	// ① 把请求体 JSON 解析进结构体
+	// ① 把请求体 JSON 解析进请求结构体
 	// 请求示例：{"name":"DeepSeek 主","provider":"deepseek","base_url":"https://api.deepseek.com/v1","api_key":"sk-xxx","weight":1}
-	if err := c.ShouldBindJSON(&ch); err != nil {
+	var req channelReq
+	if err := c.ShouldBindJSON(&req); err != nil {
 		resp(c, 400, "参数错误: "+err.Error(), nil)
 		return
 	}
 
-	// ② 密钥加密：API Key 绝不明文落库
+	// ② 组装模型：enabled 默认启用，显式传了才覆盖（绕开 GORM 零值吞 false 的陷阱）
+	ch := model.Channel{
+		Name:     req.Name,
+		Provider: req.Provider,
+		BaseURL:  req.BaseURL,
+		APIKey:   req.APIKey,
+		Weight:   req.Weight,
+		Enabled:  true, // 与模型 default:true 语义一致
+		Models:   req.Models,
+	}
+	if req.Enabled != nil {
+		ch.Enabled = *req.Enabled // 用户显式传了 enabled → 按传的来（false 也能存）
+	}
+
+	// ③ 密钥加密：API Key 绝不明文落库
 	// 加密后才写库，库里只存 hex 密文（解密动作在转发时由 relay 做）
 	if ch.APIKey != "" {
 		encKey, err := h.enc.Encrypt(ch.APIKey)
@@ -76,14 +107,15 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 		ch.APIKey = encKey // 用密文替换明文，后续 GORM 落库的就是密文
 	}
 
-	// ③ GORM 写库：INSERT INTO channels (...) VALUES (...)
+	// ④ GORM 写库：INSERT INTO channels (...) VALUES (...)
 	//    - ID（自增）和 CreatedAt（当前时间）由数据库/GORM 自动填充
 	if err := h.db.Create(&ch).Error; err != nil {
 		resp(c, 500, "创建失败: "+err.Error(), nil)
 		return
 	}
 
-	// ④ 返回创建成功的渠道（走 channelView，密钥不返回）
+	// ⑤ 返回创建成功的渠道（走 channelView，密钥不返回）
+	h.cache.Refresh() // 热更新：新渠道立即进入转发侧候选池
 	resp(c, 0, "ok", channelView(ch))
 }
 
@@ -151,7 +183,7 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 	}
 
 	// ③ 解析请求体（传什么更新什么，缺省字段保持原值）
-	var req model.Channel
+	var req channelReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		resp(c, 400, "参数错误: "+err.Error(), nil)
 		return
@@ -162,6 +194,8 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 	//    比如 weight 传 0、enabled 传 false，会被当成"没传"而跳过更新
 	//    用 map 更新则 0/false 也会真实写入
 	//
+	//    ⚠️ enabled 特殊处理：只有显式传了才更新（*bool 非 nil）
+	//       修复：旧实现恒写 req.Enabled=false，任何不带 enabled 的 PUT 都会把渠道禁用
 	//    ⚠️ api_key 特殊处理：留空 = 不更新（保持原密钥）
 	//       - 防止"没传密钥"把库里密钥清成空串（原实现的隐患）
 	//       - 防止把空串加密成密文写进去
@@ -171,8 +205,10 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		"provider": req.Provider,
 		"base_url": req.BaseURL,
 		"weight":   req.Weight,
-		"enabled":  req.Enabled,
 		"models":   req.Models,
+	}
+	if req.Enabled != nil {
+		updates["enabled"] = *req.Enabled // 显式传了才写，缺省保持原值
 	}
 	if req.APIKey != "" {
 		encKey, err := h.enc.Encrypt(req.APIKey)
@@ -190,6 +226,7 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 
 	// ⑤ 重新查询一次，返回更新后的最新数据（Updates 不会回填结构体）
 	h.db.First(&ch, id)
+	h.cache.Refresh() // 热更新：改动立即影响转发侧调度
 	resp(c, 0, "ok", channelView(ch))
 }
 
@@ -220,5 +257,6 @@ func (h *ChannelHandler) Delete(c *gin.Context) {
 		resp(c, 500, "删除失败: "+err.Error(), nil)
 		return
 	}
+	h.cache.Refresh() // 热更新：删除的渠道立即从候选池移除
 	resp(c, 0, "ok", nil) // 删除成功，无数据返回
 }
