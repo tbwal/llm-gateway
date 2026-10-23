@@ -19,8 +19,9 @@ import (
 )
 
 func main() {
-	// 注册处理器：OpenAI 兼容的聊天补全接口
+	// 注册处理器：OpenAI 兼容的聊天补全接口 + Anthropic Messages API
 	http.HandleFunc("/v1/chat/completions", handleChat)
+	http.HandleFunc("/v1/messages", handleMessages) // 模拟 Claude：协议转换的本地验证目标
 	log.Println("mock 上游已启动: http://localhost:9090")
 	log.Fatal(http.ListenAndServe(":9090", nil)) // 阻塞监听，Ctrl+C 退出
 }
@@ -108,4 +109,112 @@ func handleStream(w http.ResponseWriter) {
 	// ⑤ SSE 结束标记（OpenAI 约定的 [DONE]）
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// ============================================================
+// Anthropic Messages API（模拟 Claude）
+//
+// 为什么加它：网关要做 Anthropic ↔ OpenAI 协议转换（W2），
+// 本地必须有一个"Anthropic 格式的上游"用来闭环验证。
+// 客户端侧（网关）永远只发 OpenAI 格式，这里模拟的是"真实 Claude"
+// 会返回的格式——包括请求路径 /v1/messages 和流式事件序列。
+//
+// Anthropic 流式和 OpenAI 流式的本质区别：
+//   - OpenAI：每块 data: {"choices":[{"delta":{"content":"..."}}]}，靠 [DONE] 收尾
+//   - Anthropic：用 event: 行区分事件类型，一个会话有 6 种事件：
+//     message_start → content_block_start → content_block_delta × N
+//     → content_block_stop → message_delta → message_stop
+// ============================================================
+
+// handleMessages Anthropic Messages API 统一入口：按 stream 字段分发
+func handleMessages(w http.ResponseWriter, r *http.Request) {
+	// ① 读取请求体（真实 Claude 在这里解析消息并调用大模型）
+	body, _ := io.ReadAll(r.Body)
+	log.Printf("mock(Anthropic) 收到请求: %s", body)
+
+	// ② 解析 stream 字段（Anthropic 也支持 stream:true）
+	var req struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(body, &req)
+
+	// ③ 按模式分发
+	if req.Stream {
+		handleMessagesStream(w) // 流式：Anthropic 事件序列
+		return
+	}
+	handleMessagesOnce(w) // 普通：一次性返回
+}
+
+// handleMessagesOnce Anthropic 非流式响应
+// 和 OpenAI 的关键差异：content 是数组（元素带 type），结束原因叫 stop_reason
+func handleMessagesOnce(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"id":            "msg_mock_001",
+		"type":          "message",
+		"role":          "assistant",
+		"content": []map[string]any{
+			{"type": "text", "text": "我是 mock 上游的回复：收到你的请求了！（Anthropic 格式）"},
+		},
+		"model":         "claude-3-5-sonnet",
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
+		"usage":         map[string]any{"input_tokens": 12, "output_tokens": 10},
+	})
+}
+
+// handleMessagesStream Anthropic 流式响应（SSE）
+//
+// 事件序列（与真实 Claude 一致）：
+//   message_start        会话开始，带消息元信息（id/model/usage 预估）
+//   content_block_start  第一个内容块开始
+//   content_block_delta  增量文本（打字机本体，OpenAI 的 delta.content 对应这里的 delta.text）
+//   content_block_stop   内容块结束
+//   message_delta        结束原因（stop_reason）+ 输出用量
+//   message_stop         会话结束（对应 OpenAI 的 [DONE]）
+func handleMessagesStream(w http.ResponseWriter) {
+	// ① SSE 必备响应头
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// ② Flusher 检查
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "当前连接不支持流式", http.StatusInternalServerError)
+		return
+	}
+
+	// sseEvent 推送一条 Anthropic 事件：event: 行 + data: 行 + 空行
+	sseEvent := func(event, data string) {
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+		flusher.Flush()
+	}
+
+	// ③ message_start：会话开始（带预估用量）
+	sseEvent("message_start",
+		`{"type":"message_start","message":{"id":"msg_mock_001","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet","usage":{"input_tokens":12,"output_tokens":1}}}`)
+
+	// ④ content_block_start：第一个文本块开始
+	sseEvent("content_block_start",
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+
+	// ⑤ content_block_delta × N：逐字增量（打字机本体）
+	tokens := []string{"你好", "，", "我", "是", "流式", "回复", "，", "打字机", "效果", "！"}
+	for _, token := range tokens {
+		sseEvent("content_block_delta",
+			fmt.Sprintf(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":%q}}`, token))
+		time.Sleep(200 * time.Millisecond) // 模拟生成耗时
+	}
+
+	// ⑥ content_block_stop：内容块结束
+	sseEvent("content_block_stop", `{"type":"content_block_stop","index":0}`)
+
+	// ⑦ message_delta：结束原因 + 输出用量
+	sseEvent("message_delta",
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":10}}`)
+
+	// ⑧ message_stop：会话结束（Anthropic 没有 [DONE]，这就是它的收尾标记）
+	sseEvent("message_stop", `{"type":"message_stop"}`)
 }

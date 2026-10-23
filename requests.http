@@ -76,3 +76,56 @@ Content-Type: application/json
     {"role": "user", "content": "来一段流式回复"}
   ]
 }
+
+
+
+### [W2-②-1] 创建 Anthropic 渠道（渠道 13 已建好，可跳过；重跑会新建 14）
+POST http://localhost:8080/api/channels
+Content-Type: application/json
+
+{
+  "name": "Claude Conv Test",
+  "provider": "anthropic",
+  "base_url": "http://localhost:9090/v1",
+  "api_key": "sk-claude-test-001",
+  "weight": 1000000,
+  "enabled": true,
+  "models": "claude-3-5-sonnet"
+}
+
+### [W2-②-2] 流式转换验证：model=claude-3-5-sonnet（stream=true）
+# 预期：OpenAI 格式 SSE —— data: {"choices":[{"delta":{"content":"..."}}]}
+#      末尾 data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}
+#      再补一个 data: [DONE]（修复 A：Anthropic 无 [DONE]，网关补发）
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "claude-3-5-sonnet",
+  "messages": [{"role": "user", "content": "你好"}],
+  "stream": true
+}
+
+### [W2-②-3] 非流式转换验证：stream=false（修复 B）
+# 预期：OpenAI 格式 {"choices":[{"message":{"role":"assistant","content":"...（Anthropic 格式）"},"finish_reason":"stop"}],"usage":{...}}
+# 内容带"（Anthropic 格式）"后缀 = 命中的是 Anthropic 渠道且转换成功
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "claude-3-5-sonnet",
+  "messages": [{"role": "user", "content": "你好"}],
+  "stream": false
+}
+
+### [W2-②-4] 路由隔离：model 不匹配 claude 渠道
+# 预期：渠道 13（models=claude-3-5-sonnet）不被命中
+# 看 server 终端日志 "[relay] 尝试渠道 id=X" 确认命中了谁；响应仍是合法 OpenAI 格式
+POST http://localhost:8080/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gpt-4o",
+  "messages": [{"role": "user", "content": "hi"}],
+  "stream": true
+}

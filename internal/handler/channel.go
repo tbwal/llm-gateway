@@ -48,6 +48,7 @@ func channelView(ch model.Channel) gin.H {
 		"base_url":   ch.BaseURL,
 		"weight":     ch.Weight,
 		"enabled":    ch.Enabled,
+		"models":     ch.Models,
 		"created_at": ch.CreatedAt,
 		// 没有 api_key —— 对外永远看不到密钥
 	}
@@ -171,6 +172,7 @@ func (h *ChannelHandler) Update(c *gin.Context) {
 		"base_url": req.BaseURL,
 		"weight":   req.Weight,
 		"enabled":  req.Enabled,
+		"models":   req.Models,
 	}
 	if req.APIKey != "" {
 		encKey, err := h.enc.Encrypt(req.APIKey)

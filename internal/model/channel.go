@@ -21,6 +21,10 @@ type Channel struct {
 	APIKey    string    `gorm:"size:255" json:"api_key"`
 	Weight    int       `gorm:"default:1" json:"weight"`              // 调度权重（权重越高被选中概率越大）
 	Enabled   bool      `gorm:"default:true" json:"enabled"`          // 是否启用（停用后调度不选它）
+	// Models 支持的模型列表（逗号分隔，如 "claude-3-5-sonnet,claude-3-haiku"）
+	// 路由层用它做"按模型过滤候选渠道"：客户端请求的 model 不在此列表 → 该渠道不参与调度
+	// 空 = 支持所有模型（兼容旧渠道，旧数据无需迁移）
+	Models    string    `gorm:"size:255" json:"models"`
 	CreatedAt time.Time `json:"created_at"`                           // 创建时间（GORM 自动填）
 }
 

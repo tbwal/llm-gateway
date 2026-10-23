@@ -45,6 +45,7 @@ func NewRelayHandler(db *gorm.DB, enc crypto.Service) *RelayHandler {
 // pickChannel 按权重加权随机选一个启用的渠道（W2 调度 + W3 排除已试）
 //
 // excluded：已经试过且失败的渠道 ID 集合（故障转移的核心：失败的不再选）
+// modelName：客户端请求里的模型名（路由层：渠道声明支持该模型才进候选池）
 //
 // 算法（前缀区间法）：
 //   权重数组 [1, 2, 3] → 总权重 6 → 想象一条分成 1:2:3 三段的刻度尺
@@ -52,17 +53,22 @@ func NewRelayHandler(db *gorm.DB, enc crypto.Service) *RelayHandler {
 //     n=0       → 渠道A（概率 1/6）
 //     n=1,2     → 渠道B（概率 2/6）
 //     n=3,4,5   → 渠道C（概率 3/6）
-func (h *RelayHandler) pickChannel(excluded map[uint]struct{}) (model.Channel, error) {
+func (h *RelayHandler) pickChannel(excluded map[uint]struct{}, modelName string) (model.Channel, error) {
 	// ① 查出所有启用的渠道（enabled = true）
 	var list []model.Channel
 	if err := h.db.Where("enabled = ?", true).Find(&list).Error; err != nil {
 		return model.Channel{}, err
 	}
 
-	// ② 过滤：跳过已试失败的渠道 + 权重保底（<1 按 1 算）
+	// ② 两层过滤：已试失败排除 + 按模型路由（只留"支持该模型"的候选）
 	candidates := make([]model.Channel, 0, len(list))
 	for _, ch := range list {
 		if _, tried := excluded[ch.ID]; tried { // 这个渠道已经试过且失败 → 排除
+			continue
+		}
+		// 路由层：渠道声明了 models 列表，但客户端请求的模型不在其中 → 不参与调度
+		// （渠道 models 为空 = 支持所有模型，兼容旧渠道无需迁移）
+		if modelName != "" && ch.Models != "" && !containsModel(ch.Models, modelName) {
 			continue
 		}
 		if ch.Weight < 1 { // 防止 0 权重渠道永远不会被选中
@@ -87,6 +93,75 @@ func (h *RelayHandler) pickChannel(excluded map[uint]struct{}) (model.Channel, e
 		}
 	}
 	return candidates[len(candidates)-1], nil // 兜底：理论上不会走到这
+}
+
+// containsModel 判断渠道的 models 列表是否包含目标模型
+// 匹配规则：逗号分隔逐项精确匹配（允许多余空白）；"*" 表示支持所有模型
+func containsModel(models, target string) bool {
+	for _, m := range strings.Split(models, ",") {
+		m = strings.TrimSpace(m)
+		if m == "*" || m == target {
+			return true
+		}
+	}
+	return false
+}
+
+// isAnthropicProvider 判断渠道上游是不是 Anthropic（Claude）
+// provider 字段取值约定：openai / deepseek / anthropic（历史也叫 claude）
+func isAnthropicProvider(provider string) bool {
+	return provider == "anthropic" || provider == "claude"
+}
+
+// convertToAnthropic 请求侧转换：客户端 OpenAI 请求 → Anthropic 请求
+//
+// 转换点（和 Anthropic 协议的差异一一对应）：
+//   - system 消息从 messages 数组拆出，变成顶层 system 字段
+//   - max_tokens 补齐（Anthropic 必填，客户端没传给默认值 1024）
+//   - messages 只保留 user / assistant 角色
+//   - 模型名、stream 原样透传
+func convertToAnthropic(body []byte) ([]byte, error) {
+	var openai struct {
+		Model     string `json:"model"`
+		Stream    bool   `json:"stream"`
+		MaxTokens int    `json:"max_tokens"`
+		Messages  []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &openai); err != nil {
+		return nil, err
+	}
+
+	// ① system 拆出（Anthropic 的 system 是顶层字段，messages 里没有）
+	var systemParts []string
+	messages := make([]map[string]any, 0, len(openai.Messages))
+	for _, m := range openai.Messages {
+		if m.Role == "system" {
+			systemParts = append(systemParts, m.Content)
+			continue
+		}
+		messages = append(messages, map[string]any{"role": m.Role, "content": m.Content})
+	}
+
+	// ② max_tokens 补齐（Anthropic 必填）
+	maxTokens := openai.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 1024
+	}
+
+	// ③ 组装 Anthropic 请求
+	anthropic := map[string]any{
+		"model":      openai.Model,
+		"max_tokens": maxTokens,
+		"messages":   messages,
+		"stream":     openai.Stream,
+	}
+	if len(systemParts) > 0 {
+		anthropic["system"] = strings.Join(systemParts, "\n")
+	}
+	return json.Marshal(anthropic)
 }
 
 // ============================================================
@@ -120,7 +195,57 @@ type sseChunk struct {
 }
 
 // parseSSEChunk 解析一条 data: 的 JSON 内容（data: 前缀已去掉）
+//
+// 双协议解析（W2-② 协议转换的核心）：
+//   - OpenAI 格式：{"choices":[{"delta":{"content":...},"finish_reason":...}]}
+//   - Anthropic 格式：{"type":"content_block_delta","delta":{"type":"text_delta","text":...}}
+//                    {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+// 先探测 type 字段判断协议，再走各自的提取逻辑；输出统一是 sseChunk（语义层）
 func parseSSEChunk(data string) (*sseChunk, error) {
+	// ① 先看有没有 type 字段：有 = Anthropic 事件；没有 = OpenAI 格式
+	var probe struct {
+		Type  string          `json:"type"`
+		Delta json.RawMessage `json:"delta"`
+		Index int             `json:"index"`
+	}
+	if err := json.Unmarshal([]byte(data), &probe); err != nil {
+		return nil, err
+	}
+
+	chunk := &sseChunk{index: probe.Index}
+
+	// ② Anthropic 事件分支
+	if probe.Type != "" {
+		switch probe.Type {
+		case "content_block_delta":
+			// delta: {"type":"text_delta","text":"你好"}
+			// 只认文本增量；tool_use 等其他类型暂无增量（将来扩展）
+			var d struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(probe.Delta, &d); err != nil {
+				return nil, err
+			}
+			if d.Type == "text_delta" {
+				chunk.content = d.Text
+			}
+		case "message_delta":
+			// delta: {"stop_reason":"end_turn","stop_sequence":null}
+			var d struct {
+				StopReason string `json:"stop_reason"`
+			}
+			if err := json.Unmarshal(probe.Delta, &d); err != nil {
+				return nil, err
+			}
+			chunk.finishReason = mapAnthropicStopReason(d.StopReason)
+		}
+		// message_start / content_block_start / content_block_stop / message_stop：
+		// 不产生增量，返回空 chunk（由 handleSSEEvent 跳过，不写回客户端）
+		return chunk, nil
+	}
+
+	// ③ OpenAI 格式分支
 	var raw struct {
 		Choices []struct {
 			Index        int    `json:"index"`
@@ -134,7 +259,6 @@ func parseSSEChunk(data string) (*sseChunk, error) {
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
 		return nil, err
 	}
-	chunk := &sseChunk{}
 	if len(raw.Choices) > 0 {
 		chunk.index = raw.Choices[0].Index
 		chunk.content = raw.Choices[0].Delta.Content
@@ -144,6 +268,20 @@ func parseSSEChunk(data string) (*sseChunk, error) {
 	}
 	chunk.usage = raw.Usage
 	return chunk, nil
+}
+
+// mapAnthropicStopReason Anthropic 结束原因 → OpenAI 语义
+//   end_turn → stop（正常结束）；max_tokens → length（截断）；
+//   tool_use → tool_calls（工具调用）；stop_sequence → stop
+func mapAnthropicStopReason(reason string) string {
+	switch reason {
+	case "max_tokens":
+		return "length"
+	case "tool_use":
+		return "tool_calls"
+	default: // end_turn / stop_sequence / 空
+		return "stop"
+	}
 }
 
 // render 把解析出的增量重组成 OpenAI 格式的 SSE 事件字节
@@ -175,7 +313,10 @@ func (c *sseChunk) render() []byte {
 
 // handleSSEEvent 处理一条完整 SSE 事件（已按空行切好）：
 // 提取 data 行 → [DONE] 透传 → 解析 → 增量重组 → 写回 + Flush
-func handleSSEEvent(c *gin.Context, event []byte) error {
+// handleSSEEvent 处理一条完整 SSE 事件（已攒到空行）
+// 返回值 done=true 表示"已向客户端发出 [DONE] 收尾标记"
+// （forwardSSE 靠它判断要不要在 EOF 时补发 [DONE]：Anthropic 上游没有 [DONE]）
+func handleSSEEvent(c *gin.Context, event []byte) (bool, error) {
 	// ① 提取事件里所有 data: 行（SSE 规范：多条 data 用 \n 连接；忽略 event:/id:/retry:）
 	lines := strings.Split(string(event), "\n")
 	var datas []string
@@ -186,35 +327,41 @@ func handleSSEEvent(c *gin.Context, event []byte) error {
 		}
 	}
 	if len(datas) == 0 {
-		return nil // 纯注释/心跳行，忽略
+		return false, nil // 纯注释/心跳行，忽略
 	}
 	data := strings.Join(datas, "\n")
 
 	// ② 结束标记 [DONE]：原样透传，这是 OpenAI 流结束的约定
 	if data == "[DONE]" {
 		if _, err := io.WriteString(c.Writer, "data: [DONE]\n\n"); err != nil {
-			return err
+			return false, err
 		}
 		flushWriter(c)
-		return nil
+		return true, nil
 	}
 
 	// ③ 解析成结构化增量；解析失败（非 JSON 的 data）→ 容错原样透传，不打断流
 	chunk, err := parseSSEChunk(data)
 	if err != nil {
 		if _, werr := c.Writer.Write(event); werr != nil {
-			return werr
+			return false, werr
 		}
 		flushWriter(c)
-		return nil
+		return false, nil
 	}
 
-	// ④ 增量转换：按 OpenAI 格式重组写回 + 立即 Flush（保打字机效果）
+	// ④ 无增量事件直接跳过：Anthropic 的 message_start / content_block_start /
+	//    content_block_stop / message_stop 不产生任何内容，不透传给客户端
+	if chunk.content == "" && chunk.finishReason == "" && chunk.usage == nil {
+		return false, nil
+	}
+
+	// ⑤ 增量转换：按 OpenAI 格式重组写回 + 立即 Flush（保打字机效果）
 	if _, err := c.Writer.Write(chunk.render()); err != nil {
-		return err // 客户端断连会在这里报错 → 上游 context 随之取消
+		return false, err // 客户端断连会在这里报错 → 上游 context 随之取消
 	}
 	flushWriter(c)
-	return nil
+	return false, nil
 }
 
 // forwardSSE 逐事件消费上游 SSE 流，边收边转边推
@@ -224,14 +371,17 @@ func handleSSEEvent(c *gin.Context, event []byte) error {
 func forwardSSE(c *gin.Context, upResp *http.Response) error {
 	reader := bufio.NewReader(upResp.Body)
 	var event []byte // 当前事件的缓冲（跨块攒）
+	sentDone := false // 是否已向客户端发过 [DONE]（OpenAI 上游自带；Anthropic 上游没有，EOF 时补）
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			event = append(event, line...)
 			if len(bytes.TrimSpace(line)) == 0 { // 空行 = SSE 事件分隔符
-				if err := handleSSEEvent(c, event); err != nil {
-					return err
+				done, herr := handleSSEEvent(c, event)
+				if herr != nil {
+					return herr
 				}
+				sentDone = sentDone || done
 				event = event[:0] // 清空缓冲，等下一条
 			}
 		}
@@ -244,7 +394,19 @@ func forwardSSE(c *gin.Context, upResp *http.Response) error {
 	}
 	// 流被上游截断时，最后可能剩一条没闭合的事件，也处理掉
 	if len(bytes.TrimSpace(event)) > 0 {
-		return handleSSEEvent(c, event)
+		done, herr := handleSSEEvent(c, event)
+		if herr != nil {
+			return herr
+		}
+		sentDone = sentDone || done
+	}
+	// 协议补齐：Anthropic 流用 message_stop 结束、没有 [DONE]，
+	// 客户端（OpenAI SDK）等的是 data: [DONE] 收尾 → EOF 时补发一个
+	if !sentDone {
+		if _, err := io.WriteString(c.Writer, "data: [DONE]\n\n"); err != nil {
+			return err
+		}
+		flushWriter(c)
 	}
 	return nil
 }
@@ -272,6 +434,13 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// 解析客户端请求里的 model（路由层依据：按模型匹配候选渠道）
+	// 例：{"model":"claude-3-5-sonnet",...} → 只有声明支持该模型的渠道才进候选池
+	var reqMeta struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &reqMeta)
+
 	// ② 故障转移循环（W3 核心）：
 	//    选渠道 → 转发 → 失败（网络错误/5xx）→ 记录已试 → 换下一个
 	//    ⚠️ 关键边界（面试必讲）：
@@ -281,7 +450,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 	//    所以：成功拿到响应 → 立即锁定并透传，绝不再切换（尤其 SSE 流式）
 	tried := make(map[uint]struct{}) // 已尝试过的渠道集合（去重，防止无限循环）
 	for {
-		ch, err := h.pickChannel(tried)
+		ch, err := h.pickChannel(tried, reqMeta.Model) // 路由层：按客户端 model 过滤候选渠道
 		if err != nil {
 			// 没有候选渠道了：区分"从来没渠道"和"全试完都失败"
 			if len(tried) > 0 {
@@ -294,9 +463,16 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		log.Printf("[relay] 尝试渠道 id=%d name=%s weight=%d → %s", ch.ID, ch.Name, ch.Weight, ch.BaseURL)
 
 		// 构造发给上游的请求
-		// 上游地址 = 渠道 base_url + /chat/completions
+		// 上游地址 = 渠道 base_url + 协议路径：
+		//   OpenAI 系 → /chat/completions；Anthropic → /messages
 		// 例：base_url=http://localhost:9090/v1 → http://localhost:9090/v1/chat/completions
-		upstreamURL := strings.TrimRight(ch.BaseURL, "/") + "/chat/completions"
+		upstreamURL := strings.TrimRight(ch.BaseURL, "/")
+		anthropic := isAnthropicProvider(ch.Provider)
+		if anthropic {
+			upstreamURL += "/messages"
+		} else {
+			upstreamURL += "/chat/completions"
+		}
 
 		// ⚠️ 密钥解密（第 5 步：AES-GCM 落库加密配套动作）：
 		// 库里存的 api_key 是密文，必须解成明文才能冒充"上游的合法用户"。
@@ -310,16 +486,34 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			continue
 		}
 
-		req, err := http.NewRequest(http.MethodPost, upstreamURL, bytes.NewReader(body))
+		// 请求体：claude 渠道需要把 OpenAI 请求"翻译"成 Anthropic 格式
+		// （system 拆出、max_tokens 补齐、messages 角色过滤），其余渠道原样透传
+		upBody := body
+		if anthropic {
+			upBody, err = convertToAnthropic(body)
+			if err != nil {
+				log.Printf("[relay] 渠道 id=%d 请求转换失败: %v，尝试下一个", ch.ID, err)
+				tried[ch.ID] = struct{}{}
+				continue
+			}
+		}
+
+		req, err := http.NewRequest(http.MethodPost, upstreamURL, bytes.NewReader(upBody))
 		if err != nil {
 			resp(c, 500, "构造上游请求失败: "+err.Error(), nil)
 			return
 		}
-		// 透传两个关键头：
+		// 透传关键头：
 		//   - Content-Type：告诉上游"我发的是 JSON"
-		//   - Authorization：用解密后的渠道密钥冒充"我就是 DeepSeek 的合法用户"
+		//   - 鉴权头按协议分流：OpenAI 系用 Authorization: Bearer；
+		//     Anthropic 用 x-api-key + anthropic-version（缺了会 401）
 		req.Header.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+		if anthropic {
+			req.Header.Set("x-api-key", apiKey)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		} else {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
 
 		// 发出请求（阻塞等上游响应）
 		upResp, err := h.client.Do(req)
@@ -363,6 +557,13 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 				// 客户端断连 / 上游异常中断：记录但不再切换渠道（响应已锁定）
 				log.Printf("[relay] 渠道 id=%d SSE 转发中断: %v", ch.ID, err)
 			}
+		} else if anthropic {
+			// 非流式 + Anthropic 渠道：响应是 Anthropic 格式（content 数组 + stop_reason），
+			// 客户端（OpenAI SDK）不认——必须转成 OpenAI 格式再写回
+			log.Printf("[relay] 渠道 id=%d 非流式响应，Anthropic → OpenAI 转换", ch.ID)
+			if err := convertAnthropicOnce(c, upResp); err != nil {
+				log.Printf("[relay] 渠道 id=%d 非流式转换失败: %v", ch.ID, err)
+			}
 		} else {
 			// 普通响应：边收边发，不用等全部读完
 			io.Copy(c.Writer, upResp.Body)
@@ -370,4 +571,58 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		}
 		return
 	}
+}
+
+// convertAnthropicOnce 非流式响应转换：Anthropic JSON → OpenAI 格式
+//
+// 非流式时 Anthropic 返回的是"完整消息对象"（非流式的结构与流式 6 种事件拼出的结果一致）：
+//   Anthropic: {"id":"msg_xxx","type":"message","content":[{"type":"text","text":"..."}],
+//               "stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":10}}
+//   OpenAI:    {"id":"...","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"..."},
+//               "finish_reason":"stop"}],"usage":{...}}
+func convertAnthropicOnce(c *gin.Context, upResp *http.Response) error {
+	var anth struct {
+		ID         string `json:"id"`
+		Model      string `json:"model"`
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(upResp.Body).Decode(&anth); err != nil {
+		return err
+	}
+
+	// ① 文本块拼接（Anthropic 的 content 是数组，可能多个 text 块）
+	var text string
+	for _, blk := range anth.Content {
+		if blk.Type == "text" {
+			text += blk.Text
+		}
+	}
+
+	// ② 组装 OpenAI 非流式响应（id 复用上游的，保留可追溯性）
+	openai := map[string]any{
+		"id":      anth.ID,
+		"object":  "chat.completion",
+		"model":   anth.Model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"message":       map[string]any{"role": "assistant", "content": text},
+			"finish_reason": mapAnthropicStopReason(anth.StopReason),
+		}},
+	}
+	if anth.Usage.InputTokens > 0 || anth.Usage.OutputTokens > 0 {
+		openai["usage"] = map[string]any{
+			"prompt_tokens":     anth.Usage.InputTokens,
+			"completion_tokens": anth.Usage.OutputTokens,
+			"total_tokens":      anth.Usage.InputTokens + anth.Usage.OutputTokens,
+		}
+	}
+	return json.NewEncoder(c.Writer).Encode(openai)
 }
