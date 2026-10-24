@@ -37,9 +37,9 @@ func TestSystemStatus(t *testing.T) {
 	cache := NewChannelCache(db, 0) // 启动即载入快照（2 个启用渠道）
 	breakers := newCircuitBreakers()
 
-	// 造一个熔断渠道：渠道 999 连续失败 3 次 → OPEN
+	// 造一个熔断渠道：渠道 1 连续失败 3 次 → OPEN
 	for i := 0; i < 3; i++ {
-		breakers.recordFailure(999, time.Now())
+		breakers.recordFailure(1, time.Now())
 	}
 
 	h := NewSystemStatusHandler(db, cache, breakers, config.Config{
@@ -79,6 +79,7 @@ func TestSystemStatus(t *testing.T) {
 			AccessKeys int `json:"access_keys"`
 			Breakers   []struct {
 				ChannelID uint    `json:"channel_id"`
+				Name      string  `json:"channel_name"`
 				State     string  `json:"state"`
 				Failures  int     `json:"failures"`
 				Cooldown  float64 `json:"cooldown_remaining_sec"`
@@ -105,23 +106,33 @@ func TestSystemStatus(t *testing.T) {
 	if d.AccessKeys != 1 {
 		t.Fatalf("access_keys = %d, want 1", d.AccessKeys)
 	}
-	// 熔断快照：999 处于 OPEN 且冷却剩余 > 0
-	found := false
+	// 熔断列表：2 个启用渠道都应出现（渠道 1 熔断 + 渠道 2 补齐正常），且都带渠道名
+	if len(d.Breakers) != 2 {
+		t.Fatalf("breakers 条数 = %d, want 2: %+v", len(d.Breakers), d.Breakers)
+	}
+	foundOpen := false
+	foundClosed := false
 	for _, b := range d.Breakers {
-		if b.ChannelID == 999 {
-			found = true
-			if b.State != "open" {
-				t.Fatalf("渠道 999 state = %s, want open", b.State)
+		if b.Name == "" {
+			t.Fatalf("breakers 缺少渠道名: %+v", b)
+		}
+		switch b.State {
+		case "open":
+			foundOpen = true
+			if b.ChannelID != 1 {
+				t.Fatalf("熔断渠道 id = %d, want 1", b.ChannelID)
 			}
 			if b.Failures != 3 {
-				t.Fatalf("渠道 999 failures = %d, want 3", b.Failures)
+				t.Fatalf("熔断渠道 failures = %d, want 3", b.Failures)
 			}
 			if b.Cooldown <= 0 {
-				t.Fatalf("渠道 999 冷却剩余 = %f, want > 0", b.Cooldown)
+				t.Fatalf("熔断渠道冷却剩余 = %f, want > 0", b.Cooldown)
 			}
+		case "closed":
+			foundClosed = true
 		}
 	}
-	if !found {
-		t.Fatalf("熔断快照里没有渠道 999: %+v", d.Breakers)
+	if !foundOpen || !foundClosed {
+		t.Fatalf("熔断列表应同时含 open 与 closed 补齐项: %+v", d.Breakers)
 	}
 }

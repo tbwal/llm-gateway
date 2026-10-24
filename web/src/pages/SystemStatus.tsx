@@ -231,7 +231,9 @@ export default function SystemStatusPage({ refreshTick }: { refreshTick: number 
                   const meta = BREAKER_META[b.state]
                   return (
                     <div key={b.channel_id} className="breaker-row">
-                      <div className="breaker-id">渠道 #{b.channel_id}</div>
+                      <div className="breaker-id">
+                        {b.channel_name || `渠道 #${b.channel_id}`}
+                      </div>
                       <span className="badge" style={{ color: meta.color, border: `1px solid ${meta.border}`, background: meta.bg }}>
                         <Icon name={meta.icon} size={10} />
                         {meta.text}

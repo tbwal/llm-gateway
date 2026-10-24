@@ -152,6 +152,7 @@ export async function deleteAccessKey(id: number): Promise<void> {
 
 export interface BreakerState {
   channel_id: number
+  channel_name: string
   state: 'closed' | 'open' | 'half_open'
   failures: number
   opened_at: string

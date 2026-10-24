@@ -65,16 +65,65 @@ func (h *SystemStatusHandler) Status(c *gin.Context) {
 		akCount = -1
 	}
 
+	// 熔断器状态列表（合并渠道名，补齐未请求过的启用渠道）
+	// ⚠️ 熔断器注册表是"懒创建"的：只有被路由过的渠道才有记录。
+	//    直接输出会漏掉"从未被请求"的渠道（用户看到 3/3 启用却只列出 2 个会困惑），
+	//    也会残留已删除渠道的记录。所以这里以渠道表为准做一次合并：
+	//      - 熔断记录存在 → 补上渠道名
+	//      - 渠道已被删除 → 过滤掉熔断残留
+	//      - 启用渠道无熔断记录 → 补一条"正常、失败计数 0"
+	var allChannels []model.Channel
+	if err := h.db.Find(&allChannels).Error; err != nil {
+		allChannels = nil
+	}
+	nameByID := make(map[uint]string)
+	enabledIDs := make(map[uint]bool)
+	for _, ch := range allChannels {
+		nameByID[ch.ID] = ch.Name
+		if ch.Enabled {
+			enabledIDs[ch.ID] = true
+		}
+	}
+	breakers := h.breakers.snapshotAll(now)
+	merged := make([]gin.H, 0, len(breakers)+len(enabledIDs))
+	seen := make(map[uint]bool)
+	for _, b := range breakers {
+		name, ok := nameByID[b.ChannelID]
+		if !ok {
+			continue // 渠道已删除：丢弃熔断残留记录
+		}
+		seen[b.ChannelID] = true
+		merged = append(merged, gin.H{
+			"channel_id":             b.ChannelID,
+			"channel_name":           name,
+			"state":                  b.State,
+			"failures":               b.Failures,
+			"opened_at":              b.OpenedAt,
+			"cooldown_remaining_sec": b.CooldownRem,
+		})
+	}
+	for _, id := range allChannels {
+		if !enabledIDs[id.ID] || seen[id.ID] {
+			continue
+		}
+		merged = append(merged, gin.H{
+			"channel_id":   id.ID,
+			"channel_name": id.Name,
+			"state":        "closed", // 未请求过：没有熔断记录，视为正常
+			"failures":     0,
+		})
+	}
+
 	resp(c, http.StatusOK, "ok", gin.H{
 		"server": gin.H{
 			"started_at": h.startedAt.Format(time.RFC3339),
 			"uptime":     now.Sub(h.startedAt).Round(time.Second).String(),
 		},
 		"rate_limit": gin.H{
-			"enabled":        h.cfg.RateLimitEnabled,
-			"store":          h.cfg.RateLimitStore,
-			"limit_per_min":  h.cfg.RateLimitPerMin,
-			"redis_addr":     h.cfg.RedisAddr,
+			"enabled":       h.cfg.RateLimitEnabled,
+			"store":         h.cfg.RateLimitStore,
+			"limit_per_min": h.cfg.RateLimitPerMin,
+			"redis_addr":    h.cfg.RedisAddr,
 		},
 		"security": gin.H{
 			// 只暴露"是否已显式配置"，密钥内容绝不外泄
@@ -86,6 +135,6 @@ func (h *SystemStatusHandler) Status(c *gin.Context) {
 			"last_refresh":     h.cache.LastRefresh().Format(time.RFC3339),
 		},
 		"access_keys": akCount,
-		"breakers":    h.breakers.snapshotAll(now),
+		"breakers":    merged,
 	})
 }
