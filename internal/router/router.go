@@ -46,6 +46,20 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 		api.DELETE("/:id", ch.Delete) // 删除：DELETE /api/channels/3
 	}
 
+	// AccessKey 管理（调用方凭证）：签发/启停/删除
+	//   POST   /api/access-keys          签发（返回明文仅此一次）
+	//   GET    /api/access-keys          列表（永不返回明文/哈希）
+	//   PUT    /api/access-keys/:id      改名 / 改范围 / 启停（停用=即时吊销）
+	//   DELETE /api/access-keys/:id      删除
+	akH := handler.NewAccessKeyHandler(db)
+	akg := r.Group("/api/access-keys")
+	{
+		akg.GET("", akH.List)
+		akg.POST("", akH.Create)
+		akg.PUT("/:id", akH.Update)
+		akg.DELETE("/:id", akH.Delete)
+	}
+
 	// AI 网关统一入口（第 4 步：转发）
 	// 客户端只调这一个接口，背后转发到哪个渠道由网关决定
 	var limiter ratelimit.Limiter
@@ -59,7 +73,9 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 		}
 	}
 	relay := handler.NewRelayHandler(db, enc, cache, limiter)
-	r.POST("/v1/chat/completions", relay.ChatCompletions)
+	// AccessKey 鉴权中间件：校验 Bearer 凭证 → 注入可信身份（限流/计费维度）
+	// 没有合法凭证一律 401，停用的 key 即时 401（软吊销）
+	r.POST("/v1/chat/completions", handler.AccessKeyAuth(db), relay.ChatCompletions)
 
 	// 用量看板 API（W3-③）：基于 usage_logs 流水表查询时聚合
 	//   GET /api/usage/summary   总览卡片

@@ -57,10 +57,30 @@ export interface Channel {
   updated_at: string
 }
 
+export interface AccessKey {
+  id: number
+  name: string
+  scopes: string
+  enabled: boolean
+  last_used_at: string | null
+  created_at: string
+}
+
 interface ChannelListResp {
   code: number
   message: string
   data: Channel[]
+}
+
+interface AccessKeyListResp {
+  code: number
+  message: string
+  data: AccessKey[]
+}
+
+/** 创建 AccessKey 的响应：多一个 key 字段（明文仅返回这一次） */
+export interface AccessKeyCreated extends AccessKey {
+  key: string
 }
 
 async function getJSON<T>(path: string): Promise<T> {
@@ -86,6 +106,46 @@ export function fetchBreakdown(group: 'model' | 'channel', days = 7): Promise<Br
 export async function fetchChannels(): Promise<Channel[]> {
   const resp = await getJSON<ChannelListResp>('/api/channels')
   return resp.data ?? []
+}
+
+// ===== AccessKey 管理 =====
+
+export async function fetchAccessKeys(): Promise<AccessKey[]> {
+  const resp = await getJSON<AccessKeyListResp>('/api/access-keys')
+  return resp.data ?? []
+}
+
+/** 签发新 key；返回的 data.key 是明文，仅此一次 */
+export async function createAccessKey(body: { name: string; scopes?: string }): Promise<AccessKeyCreated> {
+  const res = await fetch('/api/access-keys', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const resp = await res.json()
+  if (resp.code !== 0) throw new Error(resp.message)
+  return resp.data
+}
+
+/** 更新：改名 / 改范围 / 启停（不换 key） */
+export async function updateAccessKey(
+  id: number,
+  body: { name?: string; scopes?: string; enabled?: boolean },
+): Promise<void> {
+  const res = await fetch(`/api/access-keys/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const resp = await res.json()
+  if (resp.code !== 0) throw new Error(resp.message)
+}
+
+/** 删除（彻底吊销） */
+export async function deleteAccessKey(id: number): Promise<void> {
+  const res = await fetch(`/api/access-keys/${id}`, { method: 'DELETE' })
+  const resp = await res.json()
+  if (resp.code !== 0) throw new Error(resp.message)
 }
 
 /** 网关返回的费用单位是元，页面展示统一格式化 */

@@ -208,9 +208,9 @@ X-User-Key: test-user-001
 ### [限流-4] 第 4 次（预期 429）
 POST http://localhost:8080/v1/chat/completions
 Content-Type: application/json
-X-User-Key: test-user-001
+Authorization: Bearer sk_lgw_6fe5d0dee224caf8e8d713fe3fc97db887437afa04078eb0a99c141861b4b01c
 
-{"model": "mock-upstream", "messages": [{"role": "user", "content": "hi"}], "stream": false}
+{"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}], "stream": false}
 
 ### [W3-①-2] 无头请求：走 IP 兜底（本地共享 127.0.0.1 额度）
 POST http://localhost:8080/v1/chat/completions

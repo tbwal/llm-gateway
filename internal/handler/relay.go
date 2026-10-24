@@ -11,6 +11,7 @@ import (
 	"math/rand/v2" // 随机数：加权随机选渠道（rand.IntN 是 Go 1.22+ 推荐写法）
 	"net"          // 连接层：Dialer 超时（连接/KeepAlive 分层超时）
 	"net/http"
+	"strconv" // 字符串转整数：限流 key 拼 akID
 	"strings" // 字符串处理：去掉 base_url 末尾多余的 /、判断 Content-Type
 	"time"
 
@@ -77,10 +78,13 @@ func (h *RelayHandler) Breakers() *circuitBreakers {
 }
 
 // rateLimitKey 提取限流的"调用方标识"
-// 优先级：Authorization: Bearer <key> → X-User-Key → 客户端 IP（兜底）
-// 真实网关里这里是 AccessKey/团队 ID（鉴权后取），本网关暂未做鉴权，
-// 用调用方自报的标识做限流维度（面试讲：接入鉴权后替换为可信身份即可）
+// 优先级：可信身份（鉴权中间件注入的 AccessKey id）→ 客户端自报（兼容无鉴权链路）→ 客户端 IP
+// ⚠️ 接入 AccessKey 鉴权后，限流维度就是"可信身份"：同一个 key 不管从哪台机器调
+//    都算同一个人，真正把"限流"作用到"调用方"而不是"来源 IP"
 func (h *RelayHandler) rateLimitKey(c *gin.Context) string {
+	if akID, _ := AccessKeyFromCtx(c); akID > 0 {
+		return "ak:" + strconv.FormatUint(uint64(akID), 10)
+	}
 	if auth := c.GetHeader("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 		return "user:" + strings.TrimPrefix(auth, "Bearer ")
 	}
@@ -559,6 +563,14 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		} `json:"messages"`
 	}
 	_ = json.Unmarshal(body, &reqMeta)
+
+	// ①-b AccessKey 范围校验：这把 key 允许调哪些模型？
+	// scopes 为空 / "*" = 全部放行；否则逗号分隔的模型名精确匹配。
+	// ⚠️ 只校验"模型是否被授权"，不校验渠道是否支持——后者由 pickChannel 路由层负责
+	if _, scopes := AccessKeyFromCtx(c); scopes != "" && scopes != "*" && !containsModel(scopes, reqMeta.Model) {
+		resp(c, http.StatusForbidden, "该 AccessKey 无权调用模型 "+reqMeta.Model, nil)
+		return
+	}
 
 	// 请求侧估算 prompt tokens（拼所有消息文本；usage 缺失时兜底用）
 	promptTokensEst := 0

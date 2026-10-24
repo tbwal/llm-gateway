@@ -5,6 +5,7 @@ import { Icon } from './components/Icon'
 import Dashboard from './pages/Dashboard'
 import Channels from './pages/Channels'
 import UsageBoard from './pages/UsageBoard'
+import AccessKeys from './pages/AccessKeys'
 import Placeholder from './pages/Placeholder'
 
 // 顶部导航项：path / 标题 / 线性图标
@@ -78,7 +79,7 @@ export default function App() {
           <Route path="/" element={<Dashboard refreshTick={refreshing} />} />
           <Route path="/channels" element={<Channels refreshTick={refreshing} />} />
           <Route path="/usage" element={<UsageBoard refreshTick={refreshing} />} />
-          <Route path="/access-keys" element={<Placeholder title="AccessKey 管理" desc="后端预留：access_keys 表 + Bearer 校验中间件，实现后此页展示签发 / 启停 / 复制。" />} />
+          <Route path="/access-keys" element={<AccessKeys refreshTick={refreshing} />} />
           <Route path="/system" element={<Placeholder title="系统状态" desc="展示限流 / 熔断 / 健康探测等运行配置（后续从 /api/system/status 读取）。" />} />
           <Route path="/logs" element={<Placeholder title="请求日志" desc="预留：request_logs 表 + 列表 API，支撑首字延迟与排障。" />} />
         </Routes>
