@@ -7,7 +7,7 @@ import Channels from './pages/Channels'
 import UsageBoard from './pages/UsageBoard'
 import AccessKeys from './pages/AccessKeys'
 import SystemStatusPage from './pages/SystemStatus'
-import Placeholder from './pages/Placeholder'
+import RequestLogs from './pages/RequestLogs'
 
 // 顶部导航项：path / 标题 / 线性图标
 const NAV_ITEMS = [
@@ -82,7 +82,7 @@ export default function App() {
           <Route path="/usage" element={<UsageBoard refreshTick={refreshing} />} />
           <Route path="/access-keys" element={<AccessKeys refreshTick={refreshing} />} />
           <Route path="/system" element={<SystemStatusPage refreshTick={refreshing} />} />
-          <Route path="/logs" element={<Placeholder title="请求日志" desc="预留：request_logs 表 + 列表 API，支撑首字延迟与排障。" />} />
+          <Route path="/logs" element={<RequestLogs refreshTick={refreshing} />} />
         </Routes>
       </div>
     </div>

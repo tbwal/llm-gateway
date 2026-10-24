@@ -14,6 +14,7 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -159,4 +160,65 @@ func parseDays(c *gin.Context) int {
 // since 返回 days 天前的时刻（看板的时间下界）
 func since(days int) time.Time {
 	return time.Now().AddDate(0, 0, -days)
+}
+
+// ---------- Logs：请求日志（流水明细） ----------
+
+// Logs GET /api/usage/logs?page=1&page_size=20&model=&channel_id=&provider=&days=
+// 请求日志 = 流水表原样分页，不做聚合——每行一条真实请求记录，可审计可追溯。
+// 参数：
+//   page/page_size  分页（默认 1 / 20，page_size 上限 100）
+//   model/channel_id/provider  精确筛选（逗号分隔的 model 可传多个？保持单值，够用）
+//   days            时间范围（不传 = 全部历史；1~365）
+func (d *UsageDashboard) Logs(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	q := d.db.Model(&model.UsageLog{})
+	if v := c.Query("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 365 {
+			q = q.Where("created_at >= ?", since(n))
+		}
+	}
+	if m := strings.TrimSpace(c.Query("model")); m != "" {
+		q = q.Where("model = ?", m)
+	}
+	if ch := strings.TrimSpace(c.Query("channel_id")); ch != "" {
+		if n, err := strconv.Atoi(ch); err == nil {
+			q = q.Where("channel_id = ?", n)
+		}
+	}
+	if p := strings.TrimSpace(c.Query("provider")); p != "" {
+		q = q.Where("provider = ?", p)
+	}
+
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var items []model.UsageLog
+	if err := q.Order("created_at desc, id desc").
+		Offset((page - 1) * pageSize).
+		Limit(pageSize).
+		Find(&items).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+		"items":     items,
+	})
 }

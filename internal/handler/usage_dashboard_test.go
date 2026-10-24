@@ -42,6 +42,7 @@ func newUsageTestEnv(t *testing.T) *gin.Engine {
 		ug.GET("/summary", dash.Summary)
 		ug.GET("/breakdown", dash.Breakdown)
 		ug.GET("/daily", dash.Daily)
+		ug.GET("/logs", dash.Logs)
 	}
 	return r
 }
@@ -180,5 +181,61 @@ func TestUsageBreakdownBadGroup(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("非法 group 状态码 = %d, want 400", w.Code)
+	}
+}
+
+// TestUsageLogs 请求日志：总数、按时间倒序、分页、model 筛选
+func TestUsageLogs(t *testing.T) {
+	r := newUsageTestEnv(t)
+
+	var resp struct {
+		Total    int `json:"total"`
+		Page     int `json:"page"`
+		PageSize int `json:"page_size"`
+		Items    []struct {
+			ID         uint    `json:"id"`
+			Model      string  `json:"model"`
+			ChannelID  uint    `json:"channel_id"`
+			TotalTokens int    `json:"total_tokens"`
+			Cost       float64 `json:"cost"`
+		} `json:"items"`
+	}
+
+	// ① 默认全量：3 条，倒序（最新在前）
+	getJSON(t, r, "/api/usage/logs", &resp)
+	if resp.Total != 3 {
+		t.Fatalf("total = %d, want 3", resp.Total)
+	}
+	if len(resp.Items) != 3 {
+		t.Fatalf("items 条数 = %d, want 3", len(resp.Items))
+	}
+	if resp.Items[0].TotalTokens != 450 { // 最新一条是 gpt-4o（450）
+		t.Fatalf("首条 total_tokens = %d, want 450（应按时间倒序）", resp.Items[0].TotalTokens)
+	}
+
+	// ② 分页：page=2&page_size=2 → 1 条
+	getJSON(t, r, "/api/usage/logs?page=2&page_size=2", &resp)
+	if resp.Total != 3 || len(resp.Items) != 1 {
+		t.Fatalf("第 2 页 total=%d items=%d, want 3/1", resp.Total, len(resp.Items))
+	}
+	if resp.Page != 2 || resp.PageSize != 2 {
+		t.Fatalf("page=%d page_size=%d, want 2/2", resp.Page, resp.PageSize)
+	}
+
+	// ③ model 筛选：deepseek-chat → 2 条
+	getJSON(t, r, "/api/usage/logs?model=deepseek-chat", &resp)
+	if resp.Total != 2 {
+		t.Fatalf("model 筛选 total = %d, want 2", resp.Total)
+	}
+	for _, it := range resp.Items {
+		if it.Model != "deepseek-chat" {
+			t.Fatalf("筛选出非目标模型: %s", it.Model)
+		}
+	}
+
+	// ④ channel_id 筛选：5 → 1 条
+	getJSON(t, r, "/api/usage/logs?channel_id=5", &resp)
+	if resp.Total != 1 || resp.Items[0].ChannelID != 5 {
+		t.Fatalf("channel 筛选 total=%d, want 1", resp.Total)
 	}
 }

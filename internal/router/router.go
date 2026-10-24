@@ -87,6 +87,7 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 		ug.GET("/summary", dash.Summary)
 		ug.GET("/breakdown", dash.Breakdown)
 		ug.GET("/daily", dash.Daily)
+		ug.GET("/logs", dash.Logs) // 请求日志：流水明细分页（管理台"请求日志"页）
 	}
 
 	// 后台健康探测（W2 熔断配套）：每 15 秒扫描熔断渠道，探活成功自动恢复

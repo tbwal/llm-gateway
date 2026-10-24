@@ -179,6 +179,50 @@ export async function fetchSystemStatus(): Promise<SystemStatus> {
   return resp.data
 }
 
+// ===== 请求日志 =====
+
+export interface UsageLogItem {
+  id: number
+  channel_id: number
+  channel_name: string
+  provider: string
+  model: string
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  cost: number
+  created_at: string
+}
+
+export interface UsageLogsResp {
+  total: number
+  page: number
+  page_size: number
+  items: UsageLogItem[]
+}
+
+export interface LogsQuery {
+  page?: number
+  page_size?: number
+  model?: string
+  channel_id?: number
+  provider?: string
+  days?: number
+}
+
+export async function fetchUsageLogs(q: LogsQuery = {}): Promise<UsageLogsResp> {
+  const params = new URLSearchParams()
+  if (q.page) params.set('page', String(q.page))
+  if (q.page_size) params.set('page_size', String(q.page_size))
+  if (q.model) params.set('model', q.model)
+  if (q.channel_id) params.set('channel_id', String(q.channel_id))
+  if (q.provider) params.set('provider', q.provider)
+  if (q.days) params.set('days', String(q.days))
+  const qs = params.toString()
+  // ⚠️ 与 usage 看板其他接口一致：返回体无 code/data 包装（{total,page,page_size,items}）
+  return getJSON<UsageLogsResp>(`/api/usage/logs${qs ? `?${qs}` : ''}`)
+}
+
 /** 网关返回的费用单位是元，页面展示统一格式化 */
 export function fmtCost(v: number): string {
   return `¥${Number.isInteger(v) ? v.toFixed(2) : v.toFixed(4)}`
