@@ -11,7 +11,18 @@ import (
 
 	"llm-gateway/config"
 	"llm-gateway/internal/model"
+	"llm-gateway/internal/ratelimit"
 )
+
+// newTestLimiter 构造一个真实 memory 限流器（系统状态测试用）
+func newTestLimiter(t *testing.T) ratelimit.Limiter {
+	t.Helper()
+	l, err := ratelimit.New("memory", 60, time.Minute, "")
+	if err != nil {
+		t.Fatalf("ratelimit.New error = %v", err)
+	}
+	return l
+}
 
 // TestSystemStatus 系统状态接口：聚合字段齐全、熔断快照可读、安全字段只给布尔
 func TestSystemStatus(t *testing.T) {
@@ -48,7 +59,7 @@ func TestSystemStatus(t *testing.T) {
 		RateLimitStore:   "memory",
 		RedisAddr:        "localhost:6379",
 		SecretKey:        "", // 未配置 → secret_key_set 应为 false
-	})
+	}, newTestLimiter(t)) // 真实 memory 限流器：enabled=true、limit=60
 	r := gin.New()
 	r.GET("/api/system/status", h.Status)
 

@@ -55,3 +55,18 @@ func (m *memoryLimiter) Allow(key string) (bool, error) {
 	m.buckets[key] = kept
 	return true, nil
 }
+
+// SetLimit 运行时改上限（与 Allow 同一把锁，改小立即生效：存量时间戳超过新上限
+// 的请求在下次 Allow 直接被拒，直到滑出窗口）
+func (m *memoryLimiter) SetLimit(limit int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.limit = limit
+}
+
+// Limit 返回当前上限
+func (m *memoryLimiter) Limit() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.limit
+}

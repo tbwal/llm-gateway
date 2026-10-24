@@ -10,6 +10,7 @@ import (
 
 	"llm-gateway/config"
 	"llm-gateway/internal/model"
+	"llm-gateway/internal/ratelimit"
 )
 
 // ============================================================
@@ -34,18 +35,28 @@ type SystemStatusHandler struct {
 	cache     *channelCache
 	breakers  *circuitBreakers
 	cfg       config.Config
-	startedAt time.Time // 进程启动时刻（uptime 基准）
+	limiter   ratelimit.Limiter // 可能为 nil：限流未开启
+	startedAt time.Time         // 进程启动时刻（uptime 基准）
 }
 
-// NewSystemStatusHandler 构造器：注入 db、缓存、熔断器、配置
-func NewSystemStatusHandler(db *gorm.DB, cache *channelCache, breakers *circuitBreakers, cfg config.Config) *SystemStatusHandler {
+// NewSystemStatusHandler 构造器：注入 db、缓存、熔断器、配置、限流器
+func NewSystemStatusHandler(db *gorm.DB, cache *channelCache, breakers *circuitBreakers, cfg config.Config, limiter ratelimit.Limiter) *SystemStatusHandler {
 	return &SystemStatusHandler{
 		db:        db,
 		cache:     cache,
 		breakers:  breakers,
 		cfg:       cfg,
+		limiter:   limiter,
 		startedAt: time.Now(),
 	}
+}
+
+// rateLimitLimit 限流器存在时读运行时值，否则回退配置默认
+func rateLimitLimit(l ratelimit.Limiter, fallback int) int {
+	if l != nil {
+		return l.Limit()
+	}
+	return fallback
 }
 
 // Status GET /api/system/status —— 聚合全部运行时状态
@@ -114,15 +125,23 @@ func (h *SystemStatusHandler) Status(c *gin.Context) {
 		})
 	}
 
+	// 限流持久化值：settings 表里上次 Web 保存的次数（"" = 未保存过，走默认）
+	persisted := ""
+	var stSetting model.Setting
+	if err := h.db.Where("key = ?", "ratelimit_per_min").First(&stSetting).Error; err == nil {
+		persisted = stSetting.Value
+	}
+
 	resp(c, http.StatusOK, "ok", gin.H{
 		"server": gin.H{
 			"started_at": h.startedAt.Format(time.RFC3339),
 			"uptime":     now.Sub(h.startedAt).Round(time.Second).String(),
 		},
 		"rate_limit": gin.H{
-			"enabled":       h.cfg.RateLimitEnabled,
+			"enabled":       h.limiter != nil,
 			"store":         h.cfg.RateLimitStore,
-			"limit_per_min": h.cfg.RateLimitPerMin,
+			"limit_per_min": rateLimitLimit(h.limiter, h.cfg.RateLimitPerMin), // 实时生效值（Web 可改）
+			"persisted":     persisted,                                        // 重启保留值（""=默认）
 			"redis_addr":    h.cfg.RedisAddr,
 		},
 		"security": gin.H{

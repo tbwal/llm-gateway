@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
-import { fetchSystemStatus, type SystemStatus } from '../api'
+import { createPortal } from 'react-dom'
+import { AnimatePresence, motion } from 'framer-motion'
+import { fetchSystemStatus, updateRateLimit, type SystemStatus } from '../api'
 import { Icon } from '../components/Icon'
 
 /**
@@ -36,6 +38,12 @@ export default function SystemStatusPage({ refreshTick }: { refreshTick: number 
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
 
+  // 限流设置弹窗
+  const [rlModal, setRlModal] = useState(false)
+  const [rlValue, setRlValue] = useState('')
+  const [rlSaving, setRlSaving] = useState(false)
+  const [rlErr, setRlErr] = useState('')
+
   const load = useCallback(async () => {
     try {
       setErr('')
@@ -53,6 +61,26 @@ export default function SystemStatusPage({ refreshTick }: { refreshTick: number 
 
   const fmt = (iso: string | null | undefined) =>
     iso ? new Date(iso).toLocaleString('zh-CN') : '—'
+
+  // 保存限流次数：PUT /api/system/ratelimit → 成功后重拉状态 + 关弹窗
+  const saveRateLimit = useCallback(async () => {
+    const n = Number(rlValue)
+    if (!Number.isInteger(n) || n < 1 || n > 100000) {
+      setRlErr('请输入 1~100000 之间的整数')
+      return
+    }
+    setRlSaving(true)
+    setRlErr('')
+    try {
+      await updateRateLimit(n)
+      setRlModal(false)
+      await load()
+    } catch (e) {
+      setRlErr(e instanceof Error ? e.message : '保存失败')
+    } finally {
+      setRlSaving(false)
+    }
+  }, [rlValue, load])
 
   return (
     <div>
@@ -83,8 +111,22 @@ export default function SystemStatusPage({ refreshTick }: { refreshTick: number 
             </div>
 
             <div className="glass sys-card">
-              <div className="sys-head">
-                <Icon name="gauge" size={13} /> 限流
+              <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+                <div className="sys-head">
+                  <Icon name="gauge" size={13} /> 限流
+                </div>
+                <button
+                  className="icon-btn"
+                  title="修改限流次数（立即生效，重启保留）"
+                  onClick={() => {
+                    setRlValue(String(st.rate_limit.limit_per_min))
+                    setRlErr('')
+                    setRlModal(true)
+                  }}
+                  style={{ width: 24, height: 24 }}
+                >
+                  <Icon name="refresh" size={12} />
+                </button>
               </div>
               <div className="sys-main">
                 <span
@@ -104,6 +146,23 @@ export default function SystemStatusPage({ refreshTick }: { refreshTick: number 
               </div>
               <div className="sys-sub">
                 store={st.rate_limit.store} · redis {st.rate_limit.redis_addr}
+                {st.rate_limit.persisted ? (
+                  <span
+                    className="badge"
+                    style={{
+                      marginLeft: 8,
+                      color: 'var(--accent)',
+                      border: '1px solid rgba(139,92,246,0.35)',
+                      background: 'rgba(139,92,246,0.10)',
+                    }}
+                    title="该次数曾在管理台保存，重启后仍生效"
+                  >
+                    <Icon name="check" size={9} />
+                    重启保留
+                  </span>
+                ) : (
+                  <span style={{ marginLeft: 8, color: 'var(--text-muted)' }}>默认值</span>
+                )}
               </div>
             </div>
 
@@ -255,6 +314,67 @@ export default function SystemStatusPage({ refreshTick }: { refreshTick: number 
             )}
           </div>
         </>
+      )}
+
+      {/* ===== 限流设置弹窗 ===== */}
+      {createPortal(
+        <AnimatePresence>
+          {rlModal && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              style={{
+                position: 'fixed',
+                inset: 0,
+                background: 'rgba(2,6,23,0.6)',
+                backdropFilter: 'blur(6px)',
+                zIndex: 300,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: 20,
+              }}
+              onClick={() => setRlModal(false)}
+            >
+              <motion.div
+                initial={{ opacity: 0, scale: 0.92, y: 18 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.92, y: 18 }}
+                transition={{ type: 'spring', stiffness: 340, damping: 28 }}
+                className="glass"
+                style={{ width: 380, maxWidth: '100%', padding: 24, zIndex: 310 }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div style={{ fontWeight: 700, fontSize: 17, marginBottom: 6 }}>修改限流次数</div>
+                <div className="muted" style={{ marginBottom: 16 }}>
+                  每调用方每分钟最大请求数（滑动窗口）· 保存后立即生效，重启保留
+                </div>
+                <input
+                  className="glass-input"
+                  type="number"
+                  value={rlValue}
+                  onChange={(e) => setRlValue(e.target.value)}
+                  placeholder="如 60"
+                  autoFocus
+                  style={{ width: '100%', marginBottom: 10 }}
+                />
+                {rlErr && (
+                  <div style={{ color: 'var(--danger)', fontSize: 12.5, marginBottom: 10 }}>{rlErr}</div>
+                )}
+                <div className="row" style={{ justifyContent: 'flex-end', gap: 8, marginTop: 6 }}>
+                  <button className="icon-btn" onClick={() => setRlModal(false)} style={{ padding: '7px 14px' }}>
+                    取消
+                  </button>
+                  <button className="btn-primary" onClick={saveRateLimit} disabled={rlSaving} style={{ padding: '7px 18px' }}>
+                    {rlSaving ? '保存中…' : '保存'}
+                  </button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>,
+        document.body,
       )}
     </div>
   )

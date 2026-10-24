@@ -24,6 +24,10 @@ import "time"
 //                         避免"限流组件挂了导致整个网关不可用"）
 type Limiter interface {
 	Allow(key string) (bool, error)
+	// SetLimit 运行时调整窗口内上限（管理台"限流设置"用，立即生效，无需重启）
+	SetLimit(limit int)
+	// Limit 返回当前生效的窗口内上限（系统状态页展示实时值）
+	Limit() int
 }
 
 // New 按配置创建限流器

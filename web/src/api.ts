@@ -161,7 +161,7 @@ export interface BreakerState {
 
 export interface SystemStatus {
   server: { started_at: string; uptime: string }
-  rate_limit: { enabled: boolean; store: string; limit_per_min: number; redis_addr: string }
+  rate_limit: { enabled: boolean; store: string; limit_per_min: number; persisted?: string; redis_addr: string }
   security: { secret_key_set: boolean }
   cache: { enabled_channels: number; total_channels: number; last_refresh: string }
   access_keys: number
@@ -176,6 +176,48 @@ interface SystemStatusResp {
 
 export async function fetchSystemStatus(): Promise<SystemStatus> {
   const resp = await getJSON<SystemStatusResp>('/api/system/status')
+  return resp.data
+}
+
+// ===== 限流设置（系统状态页可改、重启保留） =====
+
+export interface RateLimitState {
+  enabled: boolean
+  store: string
+  limit_per_min: number
+  persisted?: string
+  redis_addr: string
+}
+
+interface RateLimitResp {
+  code: number
+  message: string
+  data: RateLimitState
+}
+
+export async function fetchRateLimit(): Promise<RateLimitState> {
+  const resp = await getJSON<RateLimitResp>('/api/system/ratelimit')
+  return resp.data
+}
+
+/** 运行时改窗口上限（立即生效 + 落库持久化）；参数错误后端返回真 HTTP 400 */
+export async function updateRateLimit(perMin: number): Promise<RateLimitState> {
+  const res = await fetch('/api/system/ratelimit', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ per_min: perMin }),
+  })
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`
+    try {
+      const body = await res.json()
+      if (body?.error) msg = body.error
+    } catch {
+      /* 非 JSON 错误体，用默认文案 */
+    }
+    throw new Error(msg)
+  }
+  const resp = (await res.json()) as RateLimitResp
   return resp.data
 }
 

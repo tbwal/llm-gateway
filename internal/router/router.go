@@ -7,6 +7,7 @@ package router
 import (
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,6 +16,7 @@ import (
 	"llm-gateway/config"
 	"llm-gateway/internal/crypto"
 	"llm-gateway/internal/handler"
+	"llm-gateway/internal/model"
 	"llm-gateway/internal/ratelimit"
 )
 
@@ -64,12 +66,22 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 	// 客户端只调这一个接口，背后转发到哪个渠道由网关决定
 	var limiter ratelimit.Limiter
 	if cfg.RateLimitEnabled {
-		l, err := ratelimit.New(cfg.RateLimitStore, cfg.RateLimitPerMin, time.Minute, cfg.RedisAddr)
+		// ⚠️ 持久化优先级：Web 管理台设置的限流次数（settings 表）覆盖默认配置。
+		//   限流上限 = env（启动默认）→ settings（上次 Web 设置，重启保留）→ 运行时 SetLimit
+		perMin := cfg.RateLimitPerMin
+		var st model.Setting
+		if err := db.Where("key = ?", "ratelimit_per_min").First(&st).Error; err == nil {
+			if v, perr := strconv.Atoi(st.Value); perr == nil && v >= 1 {
+				perMin = v
+				log.Printf("限流配置已从 settings 恢复: per_min=%d（管理台设置，重启保留）", v)
+			}
+		}
+		l, err := ratelimit.New(cfg.RateLimitStore, perMin, time.Minute, cfg.RedisAddr)
 		if err != nil {
 			log.Printf("⚠️ 限流器初始化失败，本次启动限流关闭: %v", err)
 		} else {
 			limiter = l
-			log.Printf("限流已开启: store=%s limit=%d/分钟", cfg.RateLimitStore, cfg.RateLimitPerMin)
+			log.Printf("限流已开启: store=%s limit=%d/分钟", cfg.RateLimitStore, perMin)
 		}
 	}
 	relay := handler.NewRelayHandler(db, enc, cache, limiter)
@@ -96,8 +108,18 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 
 	// 系统状态（管理台"系统状态"页）：聚合服务/限流/安全/缓存/熔断运行时快照
 	//   GET /api/system/status
-	sys := handler.NewSystemStatusHandler(db, cache, relay.Breakers(), cfg)
+	sys := handler.NewSystemStatusHandler(db, cache, relay.Breakers(), cfg, limiter)
 	r.GET("/api/system/status", sys.Status)
+
+	// 限流设置（管理台可改、重启保留）
+	//   GET /api/system/ratelimit → 当前配置（含持久化值）
+	//   PUT /api/system/ratelimit  → 改窗口上限（立即生效 + 落库）
+	rl := handler.NewRateLimitHandler(db, limiter, cfg)
+	rlg := r.Group("/api/system/ratelimit")
+	{
+		rlg.GET("", rl.Get)
+		rlg.PUT("", rl.Update)
+	}
 
 	return r
 }

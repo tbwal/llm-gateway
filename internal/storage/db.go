@@ -36,10 +36,10 @@ func InitDB(path string) (*gorm.DB, error) {
 	// ③ 自动迁移：把结构体 Channel 变成真实表 channels
 	// 效果等价于手写 CREATE TABLE IF NOT EXISTS channels (...)
 	// 后续每新增一个模型（AccessKey、UsageLog），加一行 AutoMigrate 即可
-	if err := db.AutoMigrate(&model.Channel{}, &model.UsageLog{}, &model.AccessKey{}); err != nil {
+	if err := db.AutoMigrate(&model.Channel{}, &model.UsageLog{}, &model.AccessKey{}, &model.Setting{}); err != nil {
 		return nil, err
 	}
 
-	log.Printf("数据库就绪: %s（表 channels、usage_logs、access_keys 已创建）", path)
+	log.Printf("数据库就绪: %s（表 channels、usage_logs、access_keys、settings 已创建）", path)
 	return db, nil
 }

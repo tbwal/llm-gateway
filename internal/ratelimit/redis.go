@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -19,7 +20,8 @@ import (
 //     并发请求不会出现"两个都查到 count=99 都放行"的竞态
 type redisLimiter struct {
 	client *redis.Client
-	limit  int
+	// limit 用 atomic 存：管理台运行时可改（SetLimit），Allow 无锁读当前值
+	limit  atomic.Int64
 	window time.Duration
 }
 
@@ -60,7 +62,9 @@ func newRedisLimiter(addr string, limit int, window time.Duration) (*redisLimite
 		client.Close()
 		return nil, fmt.Errorf("Redis 连接失败 (%s): %w", addr, err)
 	}
-	return &redisLimiter{client: client, limit: limit, window: window}, nil
+	r := &redisLimiter{client: client, window: window}
+	r.limit.Store(int64(limit)) // 初始上限来自配置（重启后先于管理台设置生效）
+	return r, nil
 }
 
 // Allow 判断 key 是否放行（Redis 原子滑动窗口）
@@ -74,12 +78,22 @@ func (r *redisLimiter) Allow(key string) (bool, error) {
 	member := fmt.Sprintf("%d:%s", now, randomSuffix()) // 唯一 member：毫秒时间戳 + 随机串
 	res, err := r.client.Eval(ctx, slidingWindowLua,
 		[]string{"ratelimit:" + key},
-		now, r.window.Milliseconds(), r.limit, member,
+		now, r.window.Milliseconds(), r.limit.Load(), member,
 	).Int()
 	if err != nil {
 		return false, err
 	}
 	return res == 1, nil
+}
+
+// SetLimit 运行时改上限（atomic 无锁，后续 Allow 的 Lua 用新值）
+func (r *redisLimiter) SetLimit(limit int) {
+	r.limit.Store(int64(limit))
+}
+
+// Limit 返回当前上限
+func (r *redisLimiter) Limit() int {
+	return int(r.limit.Load())
 }
 
 // randomSuffix 生成 8 位 hex 随机串（member 唯一性）

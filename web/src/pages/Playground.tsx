@@ -70,7 +70,6 @@ const SCENARIOS = [
 ]
 
 export default function Playground({ refreshTick }: { refreshTick: number }) {
-  const [model, setModel] = useState(SCENARIOS[0].model)
   const [bearer, setBearer] = useState('')
   const [stream, setStream] = useState(false)
   const [messagesJson, setMessagesJson] = useState(() => JSON.stringify(DEFAULT_MESSAGES, null, 2))
@@ -88,8 +87,10 @@ export default function Playground({ refreshTick }: { refreshTick: number }) {
   const [err, setErr] = useState('')
   const [copied, setCopied] = useState(false)
 
-  // 模型建议列表（来自渠道配置）
-  const [modelSuggestions, setModelSuggestions] = useState<string[]>([])
+  // 模型选择：下拉 = 渠道配置里的全部模型；"自定义" = 输入框（渠道外模型如 mock-upstream）
+  const [modelSelect, setModelSelect] = useState('custom')
+  const [customModel, setCustomModel] = useState(SCENARIOS[0].model)
+  const [modelOptions, setModelOptions] = useState<string[]>([])
   useEffect(() => {
     fetchChannels()
       .then((cs) => {
@@ -100,10 +101,13 @@ export default function Playground({ refreshTick }: { refreshTick: number }) {
             if (t && t !== '*') set.add(t)
           }
         }
-        setModelSuggestions([...set].sort())
+        setModelOptions([...set].sort())
       })
       .catch(() => {})
   }, [refreshTick])
+
+  // 实际发送的模型名（下拉选中的 或 自定义输入）
+  const effectiveModel = modelSelect === 'custom' ? customModel : modelSelect
 
   const abortRef = useRef<AbortController | null>(null)
 
@@ -146,7 +150,7 @@ export default function Playground({ refreshTick }: { refreshTick: number }) {
       const res = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers,
-        body: JSON.stringify({ model, messages: msgs, stream }),
+        body: JSON.stringify({ model: effectiveModel, messages: msgs, stream }),
         signal: controller.signal,
       })
       setStatus(res.status)
@@ -218,7 +222,7 @@ export default function Playground({ refreshTick }: { refreshTick: number }) {
     } finally {
       setSending(false)
     }
-  }, [model, bearer, stream, messagesJson, parseMessages])
+  }, [effectiveModel, bearer, stream, messagesJson, parseMessages])
 
   // 页面切换时中止进行中的请求
   useEffect(() => () => abortRef.current?.abort(), [])
@@ -235,7 +239,7 @@ export default function Playground({ refreshTick }: { refreshTick: number }) {
     } catch {
       /* 非法 JSON 时回退到默认模板 */
     }
-    const payload = JSON.stringify({ model, messages: msgs ?? DEFAULT_MESSAGES, stream })
+    const payload = JSON.stringify({ model: effectiveModel, messages: msgs ?? DEFAULT_MESSAGES, stream })
     const lines = [
       stream ? 'curl -N' : 'curl',
       '-X POST http://localhost:8080/v1/chat/completions',
@@ -244,7 +248,7 @@ export default function Playground({ refreshTick }: { refreshTick: number }) {
     if (bearer.trim()) lines.push(`-H "Authorization: Bearer ${bearer.trim()}"`)
     lines.push(`-d '${payload}'`)
     return lines.join(' \\\n  ')
-  }, [model, bearer, stream, messagesJson])
+  }, [effectiveModel, bearer, stream, messagesJson])
 
   const copyCurl = useCallback(async () => {
     try {
@@ -276,7 +280,9 @@ export default function Playground({ refreshTick }: { refreshTick: number }) {
               className="icon-btn"
               title={s.desc}
               onClick={() => {
-                setModel(s.model)
+                // 场景模型若在下拉列表里 → 选中它；否则切"自定义"并填入
+                setModelSelect(modelOptions.includes(s.model) ? s.model : 'custom')
+                setCustomModel(s.model)
                 setBearer(s.bearer)
                 setStream(s.stream)
                 setMessagesJson(JSON.stringify(s.messages, null, 2))
@@ -296,20 +302,29 @@ export default function Playground({ refreshTick }: { refreshTick: number }) {
         <div className="glass card-pad">
           <div className="panel-title" style={{ marginBottom: 14 }}>请求配置</div>
 
-          <div className="muted" style={{ marginBottom: 4 }}>模型</div>
-          <input
+          <div className="muted" style={{ marginBottom: 4 }}>模型（全部渠道已配置模型）</div>
+          <select
             className="glass-input"
-            list="model-suggestions"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder="如 gpt-5 / claude-3-5-sonnet"
-            style={{ width: '100%', marginBottom: 12 }}
-          />
-          <datalist id="model-suggestions">
-            {modelSuggestions.map((m) => (
-              <option key={m} value={m} />
+            value={modelSelect}
+            onChange={(e) => setModelSelect(e.target.value)}
+            style={{ width: '100%', marginBottom: modelSelect === 'custom' ? 8 : 12 }}
+          >
+            <option value="custom">自定义…</option>
+            {modelOptions.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
             ))}
-          </datalist>
+          </select>
+          {modelSelect === 'custom' && (
+            <input
+              className="glass-input"
+              value={customModel}
+              onChange={(e) => setCustomModel(e.target.value)}
+              placeholder="渠道外模型，如 mock-upstream"
+              style={{ width: '100%', marginBottom: 12 }}
+            />
+          )}
 
           <div className="muted" style={{ marginBottom: 4 }}>Authorization（Bearer，可留空=匿名）</div>
           <input
