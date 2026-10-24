@@ -338,6 +338,93 @@ body::after {
   color: var(--text-muted);
 }
 
+/* ------- 系统状态紧凑卡（小图标 + 大数值 + 副说明） ------- */
+.sys-card {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+}
+.sys-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  white-space: nowrap;
+}
+.sys-head svg {
+  opacity: 0.75;
+}
+.sys-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  margin-bottom: 4px;
+  min-height: 26px;
+}
+.sys-main .unit {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+.sys-sub {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+/* ------- 熔断器行 ------- */
+.breaker-list {
+  display: flex;
+  flex-direction: column;
+}
+.breaker-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.breaker-row:last-child {
+  border-bottom: none;
+}
+.breaker-id {
+  min-width: 88px;
+  font-weight: 600;
+  color: var(--text);
+}
+.breaker-desc {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.breaker-time {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
 /* ------- 主内容区 ------- */
 .dash-grid {
   display: grid;
@@ -349,6 +436,10 @@ body::after {
 .panel {
   padding: 18px 20px;
 }
+/* glass card-pad：玻璃卡片的统一定位内边距（此前未定义 = padding 0，内容贴边） */
+.card-pad {
+  padding: 18px 20px;
+}
 .panel-title {
   font-size: 14px;
   font-weight: 600;
@@ -358,10 +449,16 @@ body::after {
   align-items: center;
   gap: 8px;
   color: var(--text-primary);
+  position: relative; /* 竖条改为绝对定位：免疫行高/flex 压缩/overflow 裁切 */
+  padding-left: 24px; /* 让位：竖条 8px 内边距 + 3px 竖条 + 13px 间距 */
 }
-/* 标题前的紫色短标记（替代 emoji） */
+/* 标题前的紫色短标记（替代 emoji）：绝对定位 + 左侧留白，不贴卡片边框 */
 .panel-title::before {
   content: '';
+  position: absolute;
+  left: 8px; /* 距内容区左缘 8px：竖条与卡片边框之间留出内边距，不再视觉上贴边 */
+  top: 50%;
+  transform: translateY(-50%);
   width: 3px;
   height: 14px;
   border-radius: 2px;

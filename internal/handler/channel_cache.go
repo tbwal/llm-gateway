@@ -36,10 +36,11 @@ type channelSnapshot struct {
 
 // channelCache 渠道配置缓存
 type channelCache struct {
-	db       *gorm.DB
-	interval time.Duration               // 后台轮询周期（0 = 不轮询）
-	snap     atomic.Pointer[channelSnapshot] // 原子指针：无锁读、Copy-on-Write 写
-	stop     chan struct{}
+	db          *gorm.DB
+	interval    time.Duration               // 后台轮询周期（0 = 不轮询）
+	snap        atomic.Pointer[channelSnapshot] // 原子指针：无锁读、Copy-on-Write 写
+	lastRefresh atomic.Int64                // 最近一次快照刷新时间（UnixNano，系统状态页展示）
+	stop        chan struct{}
 }
 
 // NewChannelCache 构造器：立即载入一次快照
@@ -86,6 +87,7 @@ func (c *channelCache) Refresh() {
 		return
 	}
 	c.snap.Store(&channelSnapshot{channels: list}) // 换指针，读者无感知切换
+	c.lastRefresh.Store(time.Now().UnixNano())     // 记录刷新时刻（系统状态页展示）
 }
 
 // List 无锁读取当前快照（请求路径调用，替代每请求查库）
@@ -95,4 +97,9 @@ func (c *channelCache) List() []model.Channel {
 		return nil
 	}
 	return snap.channels
+}
+
+// LastRefresh 最近一次快照刷新时间（系统状态页展示；零值 = 从未刷新）
+func (c *channelCache) LastRefresh() time.Time {
+	return time.Unix(0, c.lastRefresh.Load())
 }

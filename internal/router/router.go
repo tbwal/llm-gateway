@@ -93,5 +93,10 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 	prober := handler.NewHealthProber(db, relay.Breakers(), 15*time.Second)
 	prober.Start()
 
+	// 系统状态（管理台"系统状态"页）：聚合服务/限流/安全/缓存/熔断运行时快照
+	//   GET /api/system/status
+	sys := handler.NewSystemStatusHandler(db, cache, relay.Breakers(), cfg)
+	r.GET("/api/system/status", sys.Status)
+
 	return r
 }

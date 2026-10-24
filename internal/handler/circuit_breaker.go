@@ -162,3 +162,47 @@ func (cb *circuitBreakers) openIDs() []uint {
 	}
 	return ids
 }
+
+// String 熔断状态的可读名（系统状态页展示用）
+func (s breakerState) String() string {
+	switch s {
+	case stateOpen:
+		return "open"
+	case stateHalfOpen:
+		return "half_open"
+	default:
+		return "closed"
+	}
+}
+
+// breakerSnapshot 单个渠道熔断状态快照（系统状态页 / 面试演示用）
+type breakerSnapshot struct {
+	ChannelID   uint      `json:"channel_id"`
+	State       string    `json:"state"`         // closed / open / half_open
+	Failures    int       `json:"failures"`      // 累计连续失败（成功清零）
+	OpenedAt    *time.Time `json:"opened_at,omitempty"` // 进入 OPEN 的时刻；nil = 从未熔断过（closed 不输出，避免零值 0001 年泄漏）
+	CooldownRem float64   `json:"cooldown_remaining_sec"` // OPEN 剩余冷却秒（0 = 不在冷却中）
+}
+
+// snapshotAll 全渠道熔断状态快照（遍历注册表，双锁：外层注册表锁 + 每个熔断器自己的锁）
+func (cb *circuitBreakers) snapshotAll(now time.Time) []breakerSnapshot {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	out := make([]breakerSnapshot, 0, len(cb.items))
+	for id, b := range cb.items {
+		b.mu.Lock()
+		s := breakerSnapshot{ChannelID: id, State: b.state.String(), Failures: b.failures}
+		if b.state == stateOpen {
+			t := b.openedAt
+			s.OpenedAt = &t // 只在 OPEN 时输出熔断时刻；closed/half_open 不输出
+			remain := breakerCooldown - now.Sub(b.openedAt)
+			if remain < 0 {
+				remain = 0
+			}
+			s.CooldownRem = remain.Seconds()
+		}
+		out = append(out, s)
+		b.mu.Unlock()
+	}
+	return out
+}

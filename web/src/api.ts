@@ -148,6 +148,36 @@ export async function deleteAccessKey(id: number): Promise<void> {
   if (resp.code !== 0) throw new Error(resp.message)
 }
 
+// ===== 系统状态 =====
+
+export interface BreakerState {
+  channel_id: number
+  state: 'closed' | 'open' | 'half_open'
+  failures: number
+  opened_at: string
+  cooldown_remaining_sec: number
+}
+
+export interface SystemStatus {
+  server: { started_at: string; uptime: string }
+  rate_limit: { enabled: boolean; store: string; limit_per_min: number; redis_addr: string }
+  security: { secret_key_set: boolean }
+  cache: { enabled_channels: number; total_channels: number; last_refresh: string }
+  access_keys: number
+  breakers: BreakerState[]
+}
+
+interface SystemStatusResp {
+  code: number
+  message: string
+  data: SystemStatus
+}
+
+export async function fetchSystemStatus(): Promise<SystemStatus> {
+  const resp = await getJSON<SystemStatusResp>('/api/system/status')
+  return resp.data
+}
+
 /** 网关返回的费用单位是元，页面展示统一格式化 */
 export function fmtCost(v: number): string {
   return `¥${Number.isInteger(v) ? v.toFixed(2) : v.toFixed(4)}`

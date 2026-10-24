@@ -2,9 +2,12 @@
 package handler
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -52,12 +55,12 @@ func NewAccessKeyHandler(db *gorm.DB) *AccessKeyHandler {
 // accessKeyView 对外视图：key_hash 永不暴露，只给业务字段
 func accessKeyView(ak model.AccessKey) gin.H {
 	return gin.H{
-		"id":          ak.ID,
-		"name":        ak.Name,
-		"scopes":      ak.Scopes,
-		"enabled":     ak.Enabled,
+		"id":           ak.ID,
+		"name":         ak.Name,
+		"scopes":       ak.Scopes,
+		"enabled":      ak.Enabled,
 		"last_used_at": ak.LastUsedAt,
-		"created_at":  ak.CreatedAt,
+		"created_at":   ak.CreatedAt,
 	}
 }
 
@@ -193,25 +196,48 @@ const contextKey = "accessKey"
 //
 // 用法：r.POST("/v1/chat/completions", handler.AccessKeyAuth(db), relay.ChatCompletions)
 //
-// 校验流程：
+// ⚠️ 鉴权粒度 = 模型级（不是全网关强制）：
+//   - 只有"被某个启用 AccessKey 的 scopes 覆盖"的模型才要求凭证
+//   - 未被任何 AccessKey 覆盖的模型 → 无凭证也放行（匿名请求）
+//   - 带凭证的请求一律走完整校验（无效凭证照样 401，不能静默放行）
+//
+// 校验流程（需要凭证时）：
 //  1. 取 Authorization → 不是 Bearer 开头 → 401
 //  2. 对 key 做 SHA-256 → 查 access_keys
 //  3. 命中且 enabled → 把 {id, name, scopes} 塞进 context → 放行
 //  4. 未命中 / 已停用 → 401（停用 = 即时吊销）
 //
-// ⚠️ 与业务接口不同：这里必须用真正的 HTTP 401（AbortWithStatusJSON），
-// 不用项目统一的 resp()（它 HTTP 恒 200）——客户端 SDK 靠 HTTP 状态码
-// 识别"凭证无效要换 key"，HTTP 200 会被误判为成功。
-// 失败文案统一且不泄露"是 key 不存在还是停用"（避免枚举探测）。
+// 面试讲点：为什么按模型粒度而不是全局强制？
+//
+//	AccessKey 是"调用方凭证"，职责是保护它被授权的模型；
+//	未授权模型属于"未纳入凭证管理"，强制要凭证反而锁死公开模型。
+//	与业务接口不同，这里必须用真正的 HTTP 401（AbortWithStatusJSON），
+//	不用项目统一的 resp()（它 HTTP 恒 200）——客户端 SDK 靠 HTTP 状态码
+//	识别"凭证无效要换 key"，HTTP 200 会被误判为成功。
+//	失败文案统一且不泄露"是 key 不存在还是停用"（避免枚举探测）。
 func AccessKeyAuth(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// ① 解析请求 model：决定该模型是否受凭证保护
+		modelName := parseRequestModel(c)
 		auth := c.GetHeader("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
+		hasAuth := strings.HasPrefix(auth, "Bearer ")
+
+		// ② 模型不受任何启用 AccessKey 保护，且没带凭证 → 匿名放行
+		if !modelProtected(db, modelName) {
+			if !hasAuth {
+				c.Next()
+				return
+			}
+			// 带了凭证：继续走完整校验（无效凭证不能因为"模型未受保护"就忽略）
+		}
+
+		// ③ 需要凭证但没带 → 401
+		if !hasAuth {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": http.StatusUnauthorized, "message": "缺少 Bearer 凭证", "data": nil})
 			return
 		}
-		plain := strings.TrimPrefix(auth, "Bearer ")
 
+		plain := strings.TrimPrefix(auth, "Bearer ")
 		var ak model.AccessKey
 		if err := db.Where("key_hash = ?", hashAccessKey(plain)).First(&ak).Error; err != nil || !ak.Enabled {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": http.StatusUnauthorized, "message": "凭证无效或已停用", "data": nil})
@@ -228,6 +254,41 @@ func AccessKeyAuth(db *gorm.DB) gin.HandlerFunc {
 		c.Set(contextKey, gin.H{"id": ak.ID, "name": ak.Name, "scopes": ak.Scopes})
 		c.Next()
 	}
+}
+
+// chatCompletionsBody 只解析鉴权需要的最小字段（model）
+type chatCompletionsBody struct {
+	Model string `json:"model"`
+}
+
+// parseRequestModel 从请求 body 读出 model（读完把 body 放回，下游 relay 还能再读）
+func parseRequestModel(c *gin.Context) string {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return ""
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	var req chatCompletionsBody
+	_ = json.Unmarshal(body, &req)
+	return req.Model
+}
+
+// modelProtected 该模型是否被任一启用 AccessKey 保护（被覆盖 → 需要凭证）
+//   - 任一启用 key 的 scopes 为空/"*"（= 全部）→ 所有模型都受保护
+//   - 否则只有 scopes 明确列出的模型受保护
+func modelProtected(db *gorm.DB, modelName string) bool {
+	var keys []model.AccessKey
+	if err := db.Where("enabled = ?", true).Find(&keys).Error; err != nil {
+		return true // 查库失败：保守按"受保护"处理（宁可多要凭证，不裸奔）
+	}
+	for _, k := range keys {
+		// scopes 空 / "*" = 全部放行语义 = 覆盖所有模型 → 需要凭证
+		s := strings.TrimSpace(k.Scopes)
+		if s == "" || s == "*" || containsModel(s, modelName) {
+			return true
+		}
+	}
+	return false
 }
 
 // AccessKeyFromCtx 从 context 取当前调用方身份（限流/计费维度）

@@ -88,16 +88,57 @@ const PATHS: Record<string, ReactNode> = {
       <path d="M12 2v10" />
     </>
   ),
+  server: (
+    <>
+      <rect x="2" y="3" width="20" height="7" rx="2" />
+      <rect x="2" y="14" width="20" height="7" rx="2" />
+      <path d="M6 6.5h.01M6 17.5h.01" />
+    </>
+  ),
+  database: (
+    <>
+      <ellipse cx="12" cy="5" rx="9" ry="3" />
+      <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+      <path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3" />
+    </>
+  ),
+  gauge: (
+    <>
+      <path d="m12 14 4-4" />
+      <path d="M3.34 19a10 10 0 1 1 17.32 0" />
+    </>
+  ),
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 6v6l4 2" />
+    </>
+  ),
+  bolt: (
+    <>
+      <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z" />
+    </>
+  ),
+  check: <path d="M20 6 9 17l-5-5" />,
+  x: (
+    <>
+      <path d="M18 6 6 18M6 6l12 12" />
+    </>
+  ),
 }
 
 export function Icon({
   name,
   size = 16,
   strokeWidth = 1.7,
+  color,
+  style,
 }: {
   name: keyof typeof PATHS | string
   size?: number
   strokeWidth?: number
+  color?: string
+  style?: React.CSSProperties
 }) {
   return (
     <svg
@@ -105,11 +146,12 @@ export function Icon({
       width={size}
       height={size}
       fill="none"
-      stroke="currentColor"
+      stroke={color ?? 'currentColor'}
       strokeWidth={strokeWidth}
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
+      style={style}
     >
       {PATHS[name]}
     </svg>

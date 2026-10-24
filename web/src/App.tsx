@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard'
 import Channels from './pages/Channels'
 import UsageBoard from './pages/UsageBoard'
 import AccessKeys from './pages/AccessKeys'
+import SystemStatusPage from './pages/SystemStatus'
 import Placeholder from './pages/Placeholder'
 
 // 顶部导航项：path / 标题 / 线性图标
@@ -80,7 +81,7 @@ export default function App() {
           <Route path="/channels" element={<Channels refreshTick={refreshing} />} />
           <Route path="/usage" element={<UsageBoard refreshTick={refreshing} />} />
           <Route path="/access-keys" element={<AccessKeys refreshTick={refreshing} />} />
-          <Route path="/system" element={<Placeholder title="系统状态" desc="展示限流 / 熔断 / 健康探测等运行配置（后续从 /api/system/status 读取）。" />} />
+          <Route path="/system" element={<SystemStatusPage refreshTick={refreshing} />} />
           <Route path="/logs" element={<Placeholder title="请求日志" desc="预留：request_logs 表 + 列表 API，支撑首字延迟与排障。" />} />
         </Routes>
       </div>
