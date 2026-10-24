@@ -20,6 +20,8 @@ func newUsageTestEnv(t *testing.T) *gin.Engine {
 		t.Fatalf("AutoMigrate(UsageLog) error = %v", err)
 	}
 	// 样本流水：2 条 deepseek-chat（同一渠道不同时间） + 1 条 gpt-4o
+	// （失败记录不进共享样本：聚合类测试口径要保持"3 条成功"；
+	//   失败落库由 newUsageLogsEnv + TestUsageLogs 单独覆盖）
 	now := time.Now()
 	samples := []model.UsageLog{
 		{ChannelID: 1, ChannelName: "DeepSeek 主", Provider: "deepseek", Model: "deepseek-chat",
@@ -42,6 +44,37 @@ func newUsageTestEnv(t *testing.T) *gin.Engine {
 		ug.GET("/summary", dash.Summary)
 		ug.GET("/breakdown", dash.Breakdown)
 		ug.GET("/daily", dash.Daily)
+		ug.GET("/logs", dash.Logs)
+	}
+	return r
+}
+
+// newUsageLogsEnv 请求日志专用环境：3 条成功 + 1 条失败（限流 429）
+func newUsageLogsEnv(t *testing.T) *gin.Engine {
+	t.Helper()
+	db := newTestDB(t)
+	if err := db.AutoMigrate(&model.UsageLog{}); err != nil {
+		t.Fatalf("AutoMigrate(UsageLog) error = %v", err)
+	}
+	now := time.Now()
+	samples := []model.UsageLog{
+		{ChannelID: 1, ChannelName: "DeepSeek 主", Provider: "deepseek", Model: "deepseek-chat",
+			PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150, Cost: 0.0500, CreatedAt: now},
+		{ChannelID: 1, ChannelName: "DeepSeek 主", Provider: "deepseek", Model: "deepseek-chat",
+			PromptTokens: 200, CompletionTokens: 100, TotalTokens: 300, Cost: 0.1000, CreatedAt: now.Add(-24 * time.Hour)},
+		{ChannelID: 5, ChannelName: "OpenAI 备用", Provider: "openai", Model: "gpt-4o",
+			PromptTokens: 300, CompletionTokens: 150, TotalTokens: 450, Cost: 0.0135, CreatedAt: now},
+		{Status: 429, Error: "限流拒绝", CreatedAt: now.Add(-time.Hour)},
+	}
+	for i, s := range samples {
+		if err := db.Create(&s).Error; err != nil {
+			t.Fatalf("插入样本 %d error = %v", i, err)
+		}
+	}
+	r := gin.New()
+	dash := NewUsageDashboard(db)
+	ug := r.Group("/api/usage")
+	{
 		ug.GET("/logs", dash.Logs)
 	}
 	return r
@@ -79,6 +112,7 @@ func TestUsageSummary(t *testing.T) {
 	if resp.Days != 7 {
 		t.Fatalf("days = %d, want 7", resp.Days)
 	}
+	// 请求数 = 3 条成功样本
 	if resp.Summary.Requests != 3 {
 		t.Fatalf("requests = %d, want 3", resp.Summary.Requests)
 	}
@@ -186,37 +220,55 @@ func TestUsageBreakdownBadGroup(t *testing.T) {
 
 // TestUsageLogs 请求日志：总数、按时间倒序、分页、model 筛选
 func TestUsageLogs(t *testing.T) {
-	r := newUsageTestEnv(t)
+	r := newUsageLogsEnv(t)
 
 	var resp struct {
 		Total    int `json:"total"`
 		Page     int `json:"page"`
 		PageSize int `json:"page_size"`
 		Items    []struct {
-			ID         uint    `json:"id"`
-			Model      string  `json:"model"`
-			ChannelID  uint    `json:"channel_id"`
-			TotalTokens int    `json:"total_tokens"`
-			Cost       float64 `json:"cost"`
+			ID          uint    `json:"id"`
+			Model       string  `json:"model"`
+			ChannelID   uint    `json:"channel_id"`
+			TotalTokens int     `json:"total_tokens"`
+			Cost        float64 `json:"cost"`
+			Status      int     `json:"status"`
+			Error       string  `json:"error"`
 		} `json:"items"`
 	}
 
-	// ① 默认全量：3 条，倒序（最新在前）
+	// ① 默认全量：4 条（3 成功 + 1 失败），倒序（最新在前）
 	getJSON(t, r, "/api/usage/logs", &resp)
-	if resp.Total != 3 {
-		t.Fatalf("total = %d, want 3", resp.Total)
+	if resp.Total != 4 {
+		t.Fatalf("total = %d, want 4（含 1 条失败记录）", resp.Total)
 	}
-	if len(resp.Items) != 3 {
-		t.Fatalf("items 条数 = %d, want 3", len(resp.Items))
+	if len(resp.Items) != 4 {
+		t.Fatalf("items 条数 = %d, want 4", len(resp.Items))
 	}
 	if resp.Items[0].TotalTokens != 450 { // 最新一条是 gpt-4o（450）
 		t.Fatalf("首条 total_tokens = %d, want 450（应按时间倒序）", resp.Items[0].TotalTokens)
 	}
+	// 失败记录也在日志里，status/error 字段正确
+	var failureFound bool
+	for _, it := range resp.Items {
+		if it.Status == 429 {
+			failureFound = true
+			if it.Error != "限流拒绝" {
+				t.Fatalf("失败记录 error = %q, want 限流拒绝", it.Error)
+			}
+			if it.TotalTokens != 0 {
+				t.Fatalf("失败记录不应有 token: %d", it.TotalTokens)
+			}
+		}
+	}
+	if !failureFound {
+		t.Fatal("日志里找不到 status=429 的失败记录（失败未落库？）")
+	}
 
-	// ② 分页：page=2&page_size=2 → 1 条
+	// ② 分页：page=2&page_size=2 → 2 条
 	getJSON(t, r, "/api/usage/logs?page=2&page_size=2", &resp)
-	if resp.Total != 3 || len(resp.Items) != 1 {
-		t.Fatalf("第 2 页 total=%d items=%d, want 3/1", resp.Total, len(resp.Items))
+	if resp.Total != 4 || len(resp.Items) != 2 {
+		t.Fatalf("第 2 页 total=%d items=%d, want 4/2", resp.Total, len(resp.Items))
 	}
 	if resp.Page != 2 || resp.PageSize != 2 {
 		t.Fatalf("page=%d page_size=%d, want 2/2", resp.Page, resp.PageSize)

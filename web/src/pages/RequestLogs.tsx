@@ -60,6 +60,15 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
 
   const fmtTime = (iso: string) => new Date(iso).toLocaleString('zh-CN')
   const fmtCost = (v: number) => (v > 0 ? `¥${v.toFixed(4)}` : '—')
+  // 状态徽标：无 status（旧数据）显示 —；2xx 绿；4xx 黄；5xx 红
+  const statusColor = (s?: number) =>
+    s == null || s === 0
+      ? 'var(--text-muted)'
+      : s < 400
+        ? 'var(--ok)'
+        : s < 500
+          ? '#fbbf24'
+          : 'var(--danger)'
 
   return (
     <div>
@@ -160,6 +169,8 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>渠道</th>
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>模型</th>
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>Provider</th>
+                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>状态</th>
+                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>错误</th>
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>输入</th>
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>输出</th>
                 <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>总 tokens</th>
@@ -175,6 +186,36 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
                   <td style={{ padding: '9px 10px' }}>
                     <span className="badge" style={{ color: 'var(--accent-soft)', border: '1px solid rgba(139,92,246,0.3)', background: 'rgba(139,92,246,0.08)', fontSize: 10.5 }}>
                       {it.provider}
+                    </span>
+                  </td>
+                  <td style={{ padding: '9px 10px' }}>
+                    <span
+                      className="badge"
+                      style={{
+                        color: statusColor(it.status),
+                        border: `1px solid ${statusColor(it.status)}44`,
+                        background: `${statusColor(it.status)}11`,
+                        fontSize: 10.5,
+                        fontVariantNumeric: 'tabular-nums',
+                      }}
+                      title={it.error || undefined}
+                    >
+                      {it.status == null || it.status === 0 ? '—' : `HTTP ${it.status}`}
+                    </span>
+                  </td>
+                  <td style={{ padding: '9px 10px', maxWidth: 220 }}>
+                    <span
+                      style={{
+                        display: 'block',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        color: it.error ? 'var(--danger)' : 'var(--text-muted)',
+                        fontSize: 11.5,
+                      }}
+                      title={it.error || undefined}
+                    >
+                      {it.error || '—'}
                     </span>
                   </td>
                   <td style={{ padding: '9px 10px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{it.prompt_tokens}</td>

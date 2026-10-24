@@ -115,12 +115,65 @@ func (h *RelayHandler) recordUsage(ch model.Channel, modelName string, promptTok
 		CompletionTokens: completionTokens,
 		TotalTokens:      promptTokens + completionTokens,
 		Cost:             cost,
+		Status:           200, // 能走到落账 = 转发成功（HTTP 200 语义）
 	}
 	if err := h.db.Create(&logEntry).Error; err != nil {
 		log.Printf("[usage] 计费落库失败: %v", err)
 		return
 	}
 	log.Printf("[usage] 渠道 id=%d model=%s tokens=%d+%d cost=%.4f元", ch.ID, modelName, promptTokens, completionTokens, cost)
+}
+
+// logUsageFailure 包级失败落库（relay 转发链路与 AccessKeyAuth 中间件共用）
+func logUsageFailure(db *gorm.DB, ch model.Channel, modelName string, status int, errMsg string) {
+	logEntry := model.UsageLog{
+		ChannelID:   ch.ID,
+		ChannelName: ch.Name,
+		Provider:    ch.Provider,
+		Model:       modelName,
+		Status:      status,
+		Error:       errMsg,
+	}
+	if err := db.Create(&logEntry).Error; err != nil {
+		log.Printf("[usage] 失败落库失败: %v", err)
+		return
+	}
+	log.Printf("[usage] 失败渠道 id=%d model=%s status=%d err=%s", ch.ID, modelName, status, errMsg)
+}
+
+// recordUsageFailure 失败也落库：把被拒绝/失败/异常的请求写成审计流水
+//
+// 原则（面试讲点）：计费流水升级为请求审计——
+//   成功的记 token/费用，失败的一样留痕（status + error 摘要），
+//   排障时能回答"这条请求为什么失败、卡在哪一层"。
+// 渠道/模型拿不到的阶段（如限流在解析 body 之前）传空值即可。
+//
+// ⚠️ 命名区分：与熔断器的 h.breakers.recordFailure（渠道故障计数）不是一回事，
+//   这里是"把一次失败请求写进 usage_logs 审计流水"
+func (h *RelayHandler) recordUsageFailure(ch model.Channel, modelName string, status int, errMsg string) {
+	logUsageFailure(h.db, ch, modelName, status, errMsg)
+}
+
+// upstreamErrorSummary 从上游错误响应体提取一句话错误摘要（排障用）
+// 兼容 OpenAI 与 Anthropic 的错误体格式：{"error":{"message":"..."}}
+// 提取失败/体为空时返回空串
+func upstreamErrorSummary(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed.Error.Message == "" {
+		return ""
+	}
+	msg := strings.TrimSpace(parsed.Error.Message)
+	if len(msg) > 200 {
+		msg = msg[:200] + "…"
+	}
+	return msg
 }
 
 // pickChannel 按权重加权随机选一个启用的渠道（W2 调度 + W3 排除已试）
@@ -539,6 +592,8 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			// 保证"限流组件挂了"不会拖垮整个网关（可用性优先），但记日志可观测
 			log.Printf("[ratelimit] 限流器故障，fail-open 放行（key=%s）: %v", key, err)
 		} else if !ok {
+			// 失败也落库：限流拒绝在解析 body 之前，渠道/模型拿不到 → 传空值
+			h.recordUsageFailure(model.Channel{}, "", http.StatusTooManyRequests, "滑动窗口内请求超限，限流拒绝")
 			resp(c, 429, "请求过于频繁，请稍后再试（滑动窗口内已达上限）", nil)
 			return
 		}
@@ -548,6 +603,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 	//    ⚠️ body 是"流"：只能读一次。这里读出来，后面要重建给每个候选上游
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		h.recordUsageFailure(model.Channel{}, "", http.StatusBadRequest, "读取请求体失败: "+err.Error())
 		resp(c, 400, "读取请求体失败: "+err.Error(), nil)
 		return
 	}
@@ -568,6 +624,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 	// scopes 为空 / "*" = 全部放行；否则逗号分隔的模型名精确匹配。
 	// ⚠️ 只校验"模型是否被授权"，不校验渠道是否支持——后者由 pickChannel 路由层负责
 	if _, scopes := AccessKeyFromCtx(c); scopes != "" && scopes != "*" && !containsModel(scopes, reqMeta.Model) {
+		h.recordUsageFailure(model.Channel{}, reqMeta.Model, http.StatusForbidden, "该 AccessKey 无权调用模型 "+reqMeta.Model)
 		resp(c, http.StatusForbidden, "该 AccessKey 无权调用模型 "+reqMeta.Model, nil)
 		return
 	}
@@ -595,8 +652,11 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		if err != nil {
 			// 没有候选渠道了：区分"从来没渠道"和"全试完都失败"
 			if len(tried) > 0 {
+				// 失败也落库：全试完都失败 → 502（网关尽力了，全是上游的锅）
+				h.recordUsageFailure(model.Channel{}, reqMeta.Model, http.StatusBadGateway, "所有渠道均不可用")
 				resp(c, 502, "所有渠道均不可用", nil) // 网关尽力了，全是上游的锅
 			} else {
+				h.recordUsageFailure(model.Channel{}, reqMeta.Model, http.StatusServiceUnavailable, "无可用渠道")
 				resp(c, 503, "无可用渠道", nil)
 			}
 			return
@@ -701,30 +761,35 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			content, usageInfo, ferr := forwardSSE(c, upResp)
 			if ferr != nil {
 				// 客户端断连 / 上游异常中断：记录但不再切换渠道（响应已锁定）
+				// 失败也落库：中断时 usage 往往拿不全，以可审计优先记失败
 				log.Printf("[relay] 渠道 id=%d SSE 转发中断: %v", ch.ID, ferr)
+				h.recordUsageFailure(ch, reqMeta.Model, upResp.StatusCode, "SSE 转发中断: "+ferr.Error())
+			} else {
+				// W3-② 计费：优先用上游返回的 usage；缺失时估算兜底
+				//   - prompt: 上游 usage 或 请求侧估算
+				//   - completion: 上游 usage 或 累计增量文本估算
+				pt := 0
+				ct := 0
+				if usageInfo != nil {
+					pt, ct = usageInfo.PromptTokens, usageInfo.CompletionTokens
+				}
+				if pt == 0 {
+					pt = promptTokensEst
+				}
+				if ct == 0 {
+					ct = usage.EstimateTokens(content)
+				}
+				h.recordUsage(ch, reqMeta.Model, pt, ct)
 			}
-			// W3-② 计费：优先用上游返回的 usage；缺失时估算兜底
-			//   - prompt: 上游 usage 或 请求侧估算
-			//   - completion: 上游 usage 或 累计增量文本估算
-			pt := 0
-			ct := 0
-			if usageInfo != nil {
-				pt, ct = usageInfo.PromptTokens, usageInfo.CompletionTokens
-			}
-			if pt == 0 {
-				pt = promptTokensEst
-			}
-			if ct == 0 {
-				ct = usage.EstimateTokens(content)
-			}
-			h.recordUsage(ch, reqMeta.Model, pt, ct)
 		} else if anthropic {
 			// 非流式 + Anthropic 渠道：响应是 Anthropic 格式（content 数组 + stop_reason），
 			// 客户端（OpenAI SDK）不认——必须转成 OpenAI 格式再写回
 			log.Printf("[relay] 渠道 id=%d 非流式响应，Anthropic → OpenAI 转换", ch.ID)
 			usageInfo, respText, cerr := convertAnthropicOnce(c, upResp)
 			if cerr != nil {
+				// 失败也落库：上游错误体不是合法 Anthropic JSON（如 4xx 错误页）→ 转换必然失败
 				log.Printf("[relay] 渠道 id=%d 非流式转换失败: %v", ch.ID, cerr)
+				h.recordUsageFailure(ch, reqMeta.Model, upResp.StatusCode, "Anthropic 响应转换失败: "+cerr.Error())
 			} else {
 				// W3-② 计费：Anthropic usage 里 input/output tokens → prompt/completion
 				// usage 缺失时兜底：prompt 用请求估算、completion 用响应文本估算
@@ -742,11 +807,18 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			respBody, rerr := io.ReadAll(upResp.Body)
 			if rerr != nil {
 				log.Printf("[relay] 渠道 id=%d 读取响应体失败: %v", ch.ID, rerr)
+				h.recordUsageFailure(ch, reqMeta.Model, upResp.StatusCode, "读取响应体失败: "+rerr.Error())
 			} else {
 				if _, werr := c.Writer.Write(respBody); werr != nil {
 					log.Printf("[relay] 渠道 id=%d 写回响应失败: %v", ch.ID, werr)
 				} else {
 					flushWriter(c) // 收尾 Flush，确保最后一截也立即送达
+				}
+				// 上游 4xx 透传给客户端 = 这次请求"失败"：记失败流水（带上游错误摘要）
+				// 200 才走计费落账；错误体摘要从 {"error":{"message":...}} 提取
+				if upResp.StatusCode >= 400 {
+					h.recordUsageFailure(ch, reqMeta.Model, upResp.StatusCode, upstreamErrorSummary(respBody))
+					return
 				}
 				// W3-② 计费：解析 OpenAI usage（prompt_tokens/completion_tokens）
 				// usage 缺失时：completion 按 choices[0].message.content 纯输出文本估算

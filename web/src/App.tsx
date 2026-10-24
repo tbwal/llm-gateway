@@ -8,6 +8,7 @@ import UsageBoard from './pages/UsageBoard'
 import AccessKeys from './pages/AccessKeys'
 import SystemStatusPage from './pages/SystemStatus'
 import RequestLogs from './pages/RequestLogs'
+import Playground from './pages/Playground'
 
 // 顶部导航项：path / 标题 / 线性图标
 const NAV_ITEMS = [
@@ -17,6 +18,7 @@ const NAV_ITEMS = [
   { path: '/access-keys', label: 'AccessKey', icon: 'key' },
   { path: '/system', label: '系统状态', icon: 'activity' },
   { path: '/logs', label: '请求日志', icon: 'list' },
+  { path: '/playground', label: '调试台', icon: 'bolt' },
 ]
 
 export default function App() {
@@ -83,6 +85,7 @@ export default function App() {
           <Route path="/access-keys" element={<AccessKeys refreshTick={refreshing} />} />
           <Route path="/system" element={<SystemStatusPage refreshTick={refreshing} />} />
           <Route path="/logs" element={<RequestLogs refreshTick={refreshing} />} />
+          <Route path="/playground" element={<Playground refreshTick={refreshing} />} />
         </Routes>
       </div>
     </div>

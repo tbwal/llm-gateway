@@ -231,5 +231,69 @@ func TestAccessKeyCRUD(t *testing.T) {
 	}
 }
 
+// TestAccessKeyFailureAudit 鉴权失败也落库：
+//   受保护模型缺凭证 → 401 的同时 usage_logs 里出现 status=401 审计记录
+func TestAccessKeyFailureAudit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestDB(t)
+	if err := db.AutoMigrate(&model.AccessKey{}, &model.UsageLog{}); err != nil {
+		t.Fatalf("AutoMigrate error = %v", err)
+	}
+
+	// 一把启用 key、scopes 空 = 保护所有模型
+	plain, hash, _ := genAccessKey()
+	if err := db.Create(&model.AccessKey{Name: "audit", KeyHash: hash, Scopes: "", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	r := gin.New()
+	r.POST("/v1", AccessKeyAuth(db), func(c *gin.Context) { c.JSON(200, gin.H{}) })
+
+	// ① 受保护模型 + 缺凭证 → 401 落库
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1", bytes.NewBufferString(`{"model":"gpt-5"}`)))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("缺凭证 status = %d, want 401", w.Code)
+	}
+	var entry model.UsageLog
+	if err := db.Where("status = ?", http.StatusUnauthorized).Order("id desc").First(&entry).Error; err != nil {
+		t.Fatalf("查不到 401 审计记录: %v", err)
+	}
+	if entry.Model != "gpt-5" {
+		t.Fatalf("审计记录 model = %q, want gpt-5（中间件阶段也应带出模型）", entry.Model)
+	}
+	if entry.Error != "缺少 Bearer 凭证" {
+		t.Fatalf("审计记录 error = %q", entry.Error)
+	}
+
+	// ② 无效凭证 → 401 落库（错误文案：凭证无效或已停用）
+	req := httptest.NewRequest(http.MethodPost, "/v1", bytes.NewBufferString(`{"model":"gpt-5"}`))
+	req.Header.Set("Authorization", "Bearer sk_lgw_invalid_key")
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("无效凭证 status = %d, want 401", w.Code)
+	}
+	var count int64
+	db.Model(&model.UsageLog{}).Where("status = ? AND error = ?", http.StatusUnauthorized, "凭证无效或已停用").Count(&count)
+	if count != 1 {
+		t.Fatalf("无效凭证审计记录 = %d, want 1", count)
+	}
+
+	// ③ 合法凭证 → 放行，不产生失败记录
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1", bytes.NewBufferString(`{"model":"gpt-5"}`))
+	req.Header.Set("Authorization", "Bearer "+plain)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("合法凭证 status = %d, want 200", w.Code)
+	}
+	var failCount int64
+	db.Model(&model.UsageLog{}).Count(&failCount)
+	if failCount != 2 {
+		t.Fatalf("总审计记录 = %d, want 2（仅两条 401，成功不落 usage）", failCount)
+	}
+}
+
 // 确保 *gorm.DB 被引用（newTestDB 返回值类型）
 var _ = gorm.ErrRecordNotFound

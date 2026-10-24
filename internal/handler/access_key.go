@@ -231,8 +231,9 @@ func AccessKeyAuth(db *gorm.DB) gin.HandlerFunc {
 			// 带了凭证：继续走完整校验（无效凭证不能因为"模型未受保护"就忽略）
 		}
 
-		// ③ 需要凭证但没带 → 401
+		// ③ 需要凭证但没带 → 401（失败也落库：审计"谁在什么时候缺凭证"）
 		if !hasAuth {
+			logUsageFailure(db, model.Channel{}, modelName, http.StatusUnauthorized, "缺少 Bearer 凭证")
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": http.StatusUnauthorized, "message": "缺少 Bearer 凭证", "data": nil})
 			return
 		}
@@ -240,6 +241,8 @@ func AccessKeyAuth(db *gorm.DB) gin.HandlerFunc {
 		plain := strings.TrimPrefix(auth, "Bearer ")
 		var ak model.AccessKey
 		if err := db.Where("key_hash = ?", hashAccessKey(plain)).First(&ak).Error; err != nil || !ak.Enabled {
+			// 失败也落库：无效/停用凭证是审计重点（暴力枚举、吊销后的残留调用都在这现形）
+			logUsageFailure(db, model.Channel{}, modelName, http.StatusUnauthorized, "凭证无效或已停用")
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": http.StatusUnauthorized, "message": "凭证无效或已停用", "data": nil})
 			return
 		}

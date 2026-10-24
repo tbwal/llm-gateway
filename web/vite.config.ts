@@ -14,6 +14,11 @@ export default defineConfig({
         target: 'http://localhost:8080',
         changeOrigin: true,
       },
+      // 调试台直接打网关统一入口（/v1/chat/completions）
+      '/v1': {
+        target: 'http://localhost:8080',
+        changeOrigin: true,
+      },
     },
   },
   build: {

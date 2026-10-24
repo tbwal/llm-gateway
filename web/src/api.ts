@@ -191,6 +191,8 @@ export interface UsageLogItem {
   completion_tokens: number
   total_tokens: number
   cost: number
+  status?: number // 失败也落库：200=成功，4xx/5xx=失败
+  error?: string // 失败时的错误摘要（成功为空）
   created_at: string
 }
 

@@ -22,6 +22,11 @@ type UsageLog struct {
 	TotalTokens      int       `json:"total_tokens"`                 // 合计
 	// Cost 费用（元）：单价 × token 数/1000
 	// 单价表在 internal/usage（简化配置；生产放 DB/配置中心）
-	Cost      float64   `json:"cost"`
+	Cost float64 `json:"cost"`
+	// Status 返回给客户端的 HTTP 状态码（成功=200；限流=429、未授权=403、无渠道=503…）
+	// 失败请求同样落库：日志从"计费流水"升级为"请求审计"（面试讲点）
+	Status int `gorm:"index" json:"status,omitempty"`
+	// Error 失败时的错误摘要（成功为空）；上限 500 字防撑爆表
+	Error     string    `gorm:"size:500" json:"error,omitempty"`
 	CreatedAt time.Time `json:"created_at"` // GORM 自动填
 }

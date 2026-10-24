@@ -594,6 +594,25 @@ select.glass-input option {
   color: #f4f4f8;
 }
 
+/* ------- 自定义滚动条（黑紫玻璃风：细窄 + 半透明紫 + 圆角） ------- */
+*::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(139, 92, 246, 0.28);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(139, 92, 246, 0.5);
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 /* ------- 通用 ------- */
 .row {
   display: flex;
