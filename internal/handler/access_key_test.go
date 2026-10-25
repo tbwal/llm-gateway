@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -78,8 +79,13 @@ func TestAccessKeyAuth(t *testing.T) {
 		{"受保护+无凭证拒绝", `{"model":"gpt-4o"}`, "", http.StatusUnauthorized},
 		// ── 未受保护模型（claude-3-5-sonnet 不在任何启用 key 的 scope）──
 		{"未受保护+无凭证放行", `{"model":"claude-3-5-sonnet"}`, "", http.StatusOK},
-		{"未受保护+启用 key 放行", `{"model":"claude-3-5-sonnet"}`, "Bearer " + enablePlain, http.StatusOK},
+		// ⚠️ 带凭证的请求会被 scope 校验拦下：key 的 scopes 只含 gpt-4o，无权调 claude
+		//   （scope 校验原在 relay ①-b，现上移到中间件 → 单层测试也能覆盖真实链路行为）
+		{"未受保护+启用 key 但 scope 不含 → 403", `{"model":"claude-3-5-sonnet"}`, "Bearer " + enablePlain, http.StatusForbidden},
 		{"未受保护+无效凭证仍拒绝", `{"model":"claude-3-5-sonnet"}`, "Bearer sk_lgw_fake", http.StatusUnauthorized},
+		// ── scope 精确匹配边界 ──
+		{"scope 精确匹配放行", `{"model":"gpt-4o"}`, "Bearer " + enablePlain, http.StatusOK},
+		{"scope 不含模型拒绝", `{"model":"gpt-5"}`, "Bearer " + enablePlain, http.StatusForbidden},
 	}
 
 	// 用完整 gin 引擎走中间件链路（能真实执行 Abort/Next）
@@ -251,7 +257,9 @@ func TestAccessKeyFailureAudit(t *testing.T) {
 
 	// ① 受保护模型 + 缺凭证 → 401 落库
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1", bytes.NewBufferString(`{"model":"gpt-5"}`)))
+	req1 := httptest.NewRequest(http.MethodPost, "/v1", bytes.NewBufferString(`{"model":"gpt-5"}`))
+	req1.RemoteAddr = "192.168.1.100:1234" // 模拟真实客户端 IP（ClientIP 解析用）
+	r.ServeHTTP(w, req1)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("缺凭证 status = %d, want 401", w.Code)
 	}
@@ -264,6 +272,18 @@ func TestAccessKeyFailureAudit(t *testing.T) {
 	}
 	if entry.Error != "缺少 Bearer 凭证" {
 		t.Fatalf("审计记录 error = %q", entry.Error)
+	}
+	// 链路 ID：中间件在最前面生成，401 也必须有（排障可关联）
+	if entry.RequestID == "" || !strings.HasPrefix(entry.RequestID, "req_") {
+		t.Fatalf("审计记录 request_id = %q, want req_ 前缀", entry.RequestID)
+	}
+	// 客户端 IP：中间件落库也应带出（审计"谁从哪调"）
+	if entry.ClientIP != "192.168.1.100" {
+		t.Fatalf("审计记录 client_ip = %q, want 192.168.1.100", entry.ClientIP)
+	}
+	// 缺凭证 = 无可信身份：access_key_id 应为 0（匿名）
+	if entry.AccessKeyID != 0 {
+		t.Fatalf("缺凭证审计 access_key_id = %d, want 0", entry.AccessKeyID)
 	}
 
 	// ② 无效凭证 → 401 落库（错误文案：凭证无效或已停用）

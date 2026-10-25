@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -192,6 +193,40 @@ func (h *AccessKeyHandler) Delete(c *gin.Context) {
 // contextKey AccessKey 信息在 gin.Context 里的 key（限流/计费从 context 取可信身份）
 const contextKey = "accessKey"
 
+// requestIDKey 链路 ID 在 gin.Context 里的 key（日志/审计/排障共用）
+const requestIDKey = "requestID"
+
+// newRequestID 生成链路 ID：req_ + 12 随机字节（24 位 hex）→ 28 字符
+// 兜底：随机源失败用纳秒时间戳（保证一定有值，不阻塞请求）
+func newRequestID() string {
+	buf := make([]byte, 12)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("req_%d", time.Now().UnixNano())
+	}
+	return "req_" + hex.EncodeToString(buf)
+}
+
+// RequestIDFromCtx 取当前请求的链路 ID（日志/失败落库用；没生成过返回 ""）
+func RequestIDFromCtx(c *gin.Context) string {
+	if v, ok := c.Get(requestIDKey); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// AccessKeyNameFromCtx 取当前调用方 AccessKey 的备注名（日志展示用）
+func AccessKeyNameFromCtx(c *gin.Context) string {
+	if v, ok := c.Get(contextKey); ok {
+		if m, ok := v.(gin.H); ok {
+			name, _ := m["name"].(string)
+			return name
+		}
+	}
+	return ""
+}
+
 // AccessKeyAuth 鉴权中间件：校验 Authorization: Bearer sk_lgw_xxx
 //
 // 用法：r.POST("/v1/chat/completions", handler.AccessKeyAuth(db), relay.ChatCompletions)
@@ -217,6 +252,9 @@ const contextKey = "accessKey"
 //	失败文案统一且不泄露"是 key 不存在还是停用"（避免枚举探测）。
 func AccessKeyAuth(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 链路 ID 在最前面生成（哪怕 401 也有 ID，失败日志可关联排障）
+		c.Set(requestIDKey, newRequestID())
+
 		// ① 解析请求 model：决定该模型是否受凭证保护
 		modelName := parseRequestModel(c)
 		auth := c.GetHeader("Authorization")
@@ -233,7 +271,7 @@ func AccessKeyAuth(db *gorm.DB) gin.HandlerFunc {
 
 		// ③ 需要凭证但没带 → 401（失败也落库：审计"谁在什么时候缺凭证"）
 		if !hasAuth {
-			logUsageFailure(db, model.Channel{}, modelName, http.StatusUnauthorized, "缺少 Bearer 凭证")
+			logUsageFailure(db, c, model.Channel{}, modelName, http.StatusUnauthorized, "缺少 Bearer 凭证")
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": http.StatusUnauthorized, "message": "缺少 Bearer 凭证", "data": nil})
 			return
 		}
@@ -242,7 +280,7 @@ func AccessKeyAuth(db *gorm.DB) gin.HandlerFunc {
 		var ak model.AccessKey
 		if err := db.Where("key_hash = ?", hashAccessKey(plain)).First(&ak).Error; err != nil || !ak.Enabled {
 			// 失败也落库：无效/停用凭证是审计重点（暴力枚举、吊销后的残留调用都在这现形）
-			logUsageFailure(db, model.Channel{}, modelName, http.StatusUnauthorized, "凭证无效或已停用")
+			logUsageFailure(db, c, model.Channel{}, modelName, http.StatusUnauthorized, "凭证无效或已停用")
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": http.StatusUnauthorized, "message": "凭证无效或已停用", "data": nil})
 			return
 		}
@@ -254,7 +292,22 @@ func AccessKeyAuth(db *gorm.DB) gin.HandlerFunc {
 			db.Model(&ak).Update("last_used_at", now)
 		}
 
+		// 注入可信身份（限流维度 + 计费审计共用）——必须在 scope 校验之前：
+		// 403 落库也要带出"是哪把 key 在越权"
 		c.Set(contextKey, gin.H{"id": ak.ID, "name": ak.Name, "scopes": ak.Scopes})
+
+		// ④ 范围校验：这把 key 被授权调哪些模型？
+		// scopes 空 / "*" = 全部放行；否则逗号分隔的模型名精确匹配。
+		// ⚠️ modelName 解析失败（body 非法 JSON）时不在这里拦——
+		//    错误码留给 relay 的 400，避免"非法 JSON + 带凭证"被误判成 403。
+		// ⚠️ 只校验"模型是否被授权"，不校验渠道是否支持——后者由路由层 pickChannel 负责。
+		if modelName != "" && ak.Scopes != "" && ak.Scopes != "*" && !containsModel(ak.Scopes, modelName) {
+			msg := "该 AccessKey 无权调用模型 " + modelName
+			logUsageFailure(db, c, model.Channel{}, modelName, http.StatusForbidden, msg)
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"code": http.StatusForbidden, "message": msg, "data": nil})
+			return
+		}
+
 		c.Next()
 	}
 }
@@ -305,4 +358,11 @@ func AccessKeyFromCtx(c *gin.Context) (uint, string) {
 		}
 	}
 	return 0, ""
+}
+
+// AccessKeyFromCtxID 取当前调用方 AccessKey 的 id（0 = 匿名）
+// 落库时记审计字段用：只需要 id，不用 scopes
+func AccessKeyFromCtxID(c *gin.Context) uint {
+	id, _ := AccessKeyFromCtx(c)
+	return id
 }

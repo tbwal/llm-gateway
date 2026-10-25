@@ -225,10 +225,14 @@ export async function updateRateLimit(perMin: number): Promise<RateLimitState> {
 
 export interface UsageLogItem {
   id: number
+  request_id?: string // 链路 ID（req_xxx）：同一请求跨日志可关联（失败/成功对应同一条）
   channel_id: number
   channel_name: string
   provider: string
   model: string
+  access_key_id?: number // 调用方 AccessKey id（0 = 匿名）
+  access_key_name?: string // 调用方备注名（冗余展示）
+  client_ip?: string // 调用方 IP（IPv6 最长 45）
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number

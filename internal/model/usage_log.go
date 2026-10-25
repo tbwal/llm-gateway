@@ -13,13 +13,17 @@ import "time"
 //     流水表只 INSERT，无锁竞争，聚合交给读侧（读多写少天然适合）
 type UsageLog struct {
 	ID               uint      `gorm:"primaryKey" json:"id"`
-	ChannelID        uint      `json:"channel_id"`          // 走了哪个渠道（id）
-	ChannelName      string    `gorm:"size:100" json:"channel_name"` // 渠道名（冗余，看板免 join）
-	Provider         string    `gorm:"size:50" json:"provider"`      // openai / anthropic / deepseek
-	Model            string    `gorm:"size:100" json:"model"`        // 客户端请求的模型名
-	PromptTokens     int       `json:"prompt_tokens"`                // 输入 token
-	CompletionTokens int       `json:"completion_tokens"`            // 输出 token
-	TotalTokens      int       `json:"total_tokens"`                 // 合计
+	RequestID        string    `gorm:"size:40;index" json:"request_id"`         // 链路 ID（req_xxx）：同一请求跨日志/排障可关联
+	ChannelID        uint      `json:"channel_id"`                              // 走了哪个渠道（id）
+	ChannelName      string    `gorm:"size:100" json:"channel_name"`            // 渠道名（冗余，看板免 join）
+	Provider         string    `gorm:"size:50" json:"provider"`                 // openai / anthropic / deepseek
+	Model            string    `gorm:"size:100" json:"model"`                   // 客户端请求的模型名
+	AccessKeyID      uint      `gorm:"index" json:"access_key_id"`              // 调用方 AccessKey（0 = 匿名请求）
+	AccessKeyName    string    `gorm:"size:100" json:"access_key_name"`         // 调用方备注名（冗余展示，免 join）
+	ClientIP         string    `gorm:"size:45" json:"client_ip"`                // 调用方 IP（IPv6 最长 45）
+	PromptTokens     int       `json:"prompt_tokens"`                           // 输入 token
+	CompletionTokens int       `json:"completion_tokens"`                       // 输出 token
+	TotalTokens      int       `json:"total_tokens"`                            // 合计
 	// Cost 费用（元）：单价 × token 数/1000
 	// 单价表在 internal/usage（简化配置；生产放 DB/配置中心）
 	Cost float64 `json:"cost"`

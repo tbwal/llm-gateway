@@ -58,7 +58,13 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
 
   const totalPages = useMemo(() => Math.max(1, Math.ceil(total / pageSize)), [total, pageSize])
 
-  const fmtTime = (iso: string) => new Date(iso).toLocaleString('zh-CN')
+  const fmtTime = (iso: string) => {
+    const d = new Date(iso)
+    // 短格式：10/25 15:25（去掉年份和秒，省出横向空间）
+    const md = `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`
+    const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+    return `${md} ${hm}`
+  }
   const fmtCost = (v: number) => (v > 0 ? `¥${v.toFixed(4)}` : '—')
   // 状态徽标：无 status（旧数据）显示 —；2xx 绿；4xx 黄；5xx 红
   const statusColor = (s?: number) =>
@@ -154,7 +160,7 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
       {err && <span style={{ color: 'var(--danger)', fontSize: '13px' }}>{err}</span>}
 
       {/* ===== 日志表格 ===== */}
-      <div className="glass card-pad">
+      <div className="glass card-pad" style={{ overflowX: 'auto' }}>
         {loading ? (
           <div style={{ opacity: 0.7, padding: '14px 0' }}>加载中…</div>
         ) : items.length === 0 ? (
@@ -162,33 +168,55 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
             没有匹配的请求记录——先去发几个 /v1/chat/completions 请求吧。
           </div>
         ) : (
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>
+          <table style={{ width: '100%', minWidth: 880, borderCollapse: 'collapse', fontSize: 12.5 }}>
             <thead>
               <tr style={{ color: 'var(--text-muted)', textAlign: 'left', fontSize: 11.5, letterSpacing: '0.04em' }}>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>时间</th>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>渠道</th>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>模型</th>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>Provider</th>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>状态</th>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>错误</th>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>输入</th>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>输出</th>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>总 tokens</th>
-                <th style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>费用</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500, whiteSpace: 'nowrap' }}>时间</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>链路 ID</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>调用方</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>IP</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>渠道</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>模型</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>Provider</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>状态</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>错误</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>输入</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>输出</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>总 tokens</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>费用</th>
               </tr>
             </thead>
             <tbody>
               {items.map((it) => (
                 <tr key={it.id} style={{ borderBottom: '1px solid var(--border)' }}>
-                  <td style={{ padding: '9px 10px', whiteSpace: 'nowrap', color: 'var(--text-secondary)' }}>{fmtTime(it.created_at)}</td>
-                  <td style={{ padding: '9px 10px' }}>{it.channel_name || `渠道 #${it.channel_id}`}</td>
-                  <td style={{ padding: '9px 10px', fontWeight: 600 }}>{it.model}</td>
-                  <td style={{ padding: '9px 10px' }}>
+                  <td style={{ padding: '9px 8px', whiteSpace: 'nowrap', color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums' }}>{fmtTime(it.created_at)}</td>
+                  <td style={{ padding: '9px 8px', maxWidth: 96 }}>
+                    <span
+                      style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-secondary)', fontSize: 11.5, fontVariantNumeric: 'tabular-nums' }}
+                      title={it.request_id}
+                    >
+                      {it.request_id || '—'}
+                    </span>
+                  </td>
+                  <td style={{ padding: '9px 8px', whiteSpace: 'nowrap' }}>
+                    {it.access_key_name ? (
+                      <span className="badge" style={{ color: 'var(--accent-soft)', border: '1px solid rgba(139,92,246,0.3)', background: 'rgba(139,92,246,0.08)', fontSize: 10.5 }}>
+                        {it.access_key_name}
+                        {it.access_key_id ? ` · #${it.access_key_id}` : ''}
+                      </span>
+                    ) : (
+                      <span className="muted" style={{ fontSize: 11.5 }}>{it.access_key_id ? `key #${it.access_key_id}` : '匿名'}</span>
+                    )}
+                  </td>
+                  <td style={{ padding: '9px 8px', whiteSpace: 'nowrap', color: 'var(--text-secondary)', fontSize: 11.5, fontVariantNumeric: 'tabular-nums' }}>{it.client_ip || '—'}</td>
+                  <td style={{ padding: '9px 8px', whiteSpace: 'nowrap' }}>{it.channel_name || `渠道 #${it.channel_id}`}</td>
+                  <td style={{ padding: '9px 8px', fontWeight: 600 }}>{it.model}</td>
+                  <td style={{ padding: '9px 8px' }}>
                     <span className="badge" style={{ color: 'var(--accent-soft)', border: '1px solid rgba(139,92,246,0.3)', background: 'rgba(139,92,246,0.08)', fontSize: 10.5 }}>
                       {it.provider}
                     </span>
                   </td>
-                  <td style={{ padding: '9px 10px' }}>
+                  <td style={{ padding: '9px 8px', whiteSpace: 'nowrap' }}>
                     <span
                       className="badge"
                       style={{
@@ -203,7 +231,7 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
                       {it.status == null || it.status === 0 ? '—' : `HTTP ${it.status}`}
                     </span>
                   </td>
-                  <td style={{ padding: '9px 10px', maxWidth: 220 }}>
+                  <td style={{ padding: '9px 8px', maxWidth: 170 }}>
                     <span
                       style={{
                         display: 'block',
@@ -218,10 +246,10 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
                       {it.error || '—'}
                     </span>
                   </td>
-                  <td style={{ padding: '9px 10px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{it.prompt_tokens}</td>
-                  <td style={{ padding: '9px 10px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{it.completion_tokens}</td>
-                  <td style={{ padding: '9px 10px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>{it.total_tokens}</td>
-                  <td style={{ padding: '9px 10px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: 'var(--text-secondary)' }}>{fmtCost(it.cost)}</td>
+                  <td style={{ padding: '9px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{it.prompt_tokens}</td>
+                  <td style={{ padding: '9px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{it.completion_tokens}</td>
+                  <td style={{ padding: '9px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>{it.total_tokens}</td>
+                  <td style={{ padding: '9px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>{fmtCost(it.cost)}</td>
                 </tr>
               ))}
             </tbody>

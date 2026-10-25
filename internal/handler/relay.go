@@ -94,6 +94,12 @@ func (h *RelayHandler) rateLimitKey(c *gin.Context) string {
 	return "ip:" + c.ClientIP()
 }
 
+// auditMeta 从 gin.Context 提取审计字段：链路 ID / 调用方 AccessKey / 客户端 IP
+// 成功与失败落库共用——日志页能回答"谁（key）从哪（IP）调了什么（model），链路 ID 是多少"
+func auditMeta(c *gin.Context) (reqID string, akID uint, akName string, ip string) {
+	return RequestIDFromCtx(c), AccessKeyFromCtxID(c), AccessKeyNameFromCtx(c), c.ClientIP()
+}
+
 // recordUsage W3-② 计费落库：把一次请求的 token 用量写成流水
 //
 // 设计原则（面试讲点）：**流水表 + 查询时聚合**
@@ -101,16 +107,21 @@ func (h *RelayHandler) rateLimitKey(c *gin.Context) string {
 //   - 聚合（SUM / 按渠道 / 按模型 / 按天）由用量看板查询时算
 //   - 不维护"每渠道一个计数行 + 每请求 UPDATE"：那是热点行锁，
 //     所有请求抢同一行写锁，并发越高越慢；INSERT 流水没有锁竞争
-func (h *RelayHandler) recordUsage(ch model.Channel, modelName string, promptTokens, completionTokens int) {
+func (h *RelayHandler) recordUsage(c *gin.Context, ch model.Channel, modelName string, promptTokens, completionTokens int) {
 	if promptTokens == 0 && completionTokens == 0 {
 		return // 什么都拿不到就不记（避免一堆 0 流水）
 	}
 	cost := usage.CalcCost(modelName, promptTokens, completionTokens)
+	reqID, akID, akName, ip := auditMeta(c)
 	logEntry := model.UsageLog{
+		RequestID:        reqID,
 		ChannelID:        ch.ID,
 		ChannelName:      ch.Name,
 		Provider:         ch.Provider,
 		Model:            modelName,
+		AccessKeyID:      akID,
+		AccessKeyName:    akName,
+		ClientIP:         ip,
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 		TotalTokens:      promptTokens + completionTokens,
@@ -121,24 +132,29 @@ func (h *RelayHandler) recordUsage(ch model.Channel, modelName string, promptTok
 		log.Printf("[usage] 计费落库失败: %v", err)
 		return
 	}
-	log.Printf("[usage] 渠道 id=%d model=%s tokens=%d+%d cost=%.4f元", ch.ID, modelName, promptTokens, completionTokens, cost)
+	log.Printf("[usage] req=%s 渠道 id=%d model=%s tokens=%d+%d cost=%.4f元", reqID, ch.ID, modelName, promptTokens, completionTokens, cost)
 }
 
 // logUsageFailure 包级失败落库（relay 转发链路与 AccessKeyAuth 中间件共用）
-func logUsageFailure(db *gorm.DB, ch model.Channel, modelName string, status int, errMsg string) {
+func logUsageFailure(db *gorm.DB, c *gin.Context, ch model.Channel, modelName string, status int, errMsg string) {
+	reqID, akID, akName, ip := auditMeta(c)
 	logEntry := model.UsageLog{
-		ChannelID:   ch.ID,
-		ChannelName: ch.Name,
-		Provider:    ch.Provider,
-		Model:       modelName,
-		Status:      status,
-		Error:       errMsg,
+		RequestID:     reqID,
+		ChannelID:     ch.ID,
+		ChannelName:   ch.Name,
+		Provider:      ch.Provider,
+		Model:         modelName,
+		AccessKeyID:   akID,
+		AccessKeyName: akName,
+		ClientIP:      ip,
+		Status:        status,
+		Error:         errMsg,
 	}
 	if err := db.Create(&logEntry).Error; err != nil {
 		log.Printf("[usage] 失败落库失败: %v", err)
 		return
 	}
-	log.Printf("[usage] 失败渠道 id=%d model=%s status=%d err=%s", ch.ID, modelName, status, errMsg)
+	log.Printf("[usage] 失败 req=%s 渠道 id=%d model=%s status=%d err=%s", reqID, ch.ID, modelName, status, errMsg)
 }
 
 // recordUsageFailure 失败也落库：把被拒绝/失败/异常的请求写成审计流水
@@ -150,8 +166,8 @@ func logUsageFailure(db *gorm.DB, ch model.Channel, modelName string, status int
 //
 // ⚠️ 命名区分：与熔断器的 h.breakers.recordFailure（渠道故障计数）不是一回事，
 //   这里是"把一次失败请求写进 usage_logs 审计流水"
-func (h *RelayHandler) recordUsageFailure(ch model.Channel, modelName string, status int, errMsg string) {
-	logUsageFailure(h.db, ch, modelName, status, errMsg)
+func (h *RelayHandler) recordUsageFailure(c *gin.Context, ch model.Channel, modelName string, status int, errMsg string) {
+	logUsageFailure(h.db, c, ch, modelName, status, errMsg)
 }
 
 // upstreamErrorSummary 从上游错误响应体提取一句话错误摘要（排障用）
@@ -593,7 +609,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			log.Printf("[ratelimit] 限流器故障，fail-open 放行（key=%s）: %v", key, err)
 		} else if !ok {
 			// 失败也落库：限流拒绝在解析 body 之前，渠道/模型拿不到 → 传空值
-			h.recordUsageFailure(model.Channel{}, "", http.StatusTooManyRequests, "滑动窗口内请求超限，限流拒绝")
+			h.recordUsageFailure(c, model.Channel{}, "", http.StatusTooManyRequests, "滑动窗口内请求超限，限流拒绝")
 			resp(c, 429, "请求过于频繁，请稍后再试（滑动窗口内已达上限）", nil)
 			return
 		}
@@ -603,7 +619,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 	//    ⚠️ body 是"流"：只能读一次。这里读出来，后面要重建给每个候选上游
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		h.recordUsageFailure(model.Channel{}, "", http.StatusBadRequest, "读取请求体失败: "+err.Error())
+		h.recordUsageFailure(c, model.Channel{}, "", http.StatusBadRequest, "读取请求体失败: "+err.Error())
 		resp(c, 400, "读取请求体失败: "+err.Error(), nil)
 		return
 	}
@@ -619,15 +635,6 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		} `json:"messages"`
 	}
 	_ = json.Unmarshal(body, &reqMeta)
-
-	// ①-b AccessKey 范围校验：这把 key 允许调哪些模型？
-	// scopes 为空 / "*" = 全部放行；否则逗号分隔的模型名精确匹配。
-	// ⚠️ 只校验"模型是否被授权"，不校验渠道是否支持——后者由 pickChannel 路由层负责
-	if _, scopes := AccessKeyFromCtx(c); scopes != "" && scopes != "*" && !containsModel(scopes, reqMeta.Model) {
-		h.recordUsageFailure(model.Channel{}, reqMeta.Model, http.StatusForbidden, "该 AccessKey 无权调用模型 "+reqMeta.Model)
-		resp(c, http.StatusForbidden, "该 AccessKey 无权调用模型 "+reqMeta.Model, nil)
-		return
-	}
 
 	// 请求侧估算 prompt tokens（拼所有消息文本；usage 缺失时兜底用）
 	promptTokensEst := 0
@@ -653,10 +660,10 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			// 没有候选渠道了：区分"从来没渠道"和"全试完都失败"
 			if len(tried) > 0 {
 				// 失败也落库：全试完都失败 → 502（网关尽力了，全是上游的锅）
-				h.recordUsageFailure(model.Channel{}, reqMeta.Model, http.StatusBadGateway, "所有渠道均不可用")
+				h.recordUsageFailure(c, model.Channel{}, reqMeta.Model, http.StatusBadGateway, "所有渠道均不可用")
 				resp(c, 502, "所有渠道均不可用", nil) // 网关尽力了，全是上游的锅
 			} else {
-				h.recordUsageFailure(model.Channel{}, reqMeta.Model, http.StatusServiceUnavailable, "无可用渠道")
+				h.recordUsageFailure(c, model.Channel{}, reqMeta.Model, http.StatusServiceUnavailable, "无可用渠道")
 				resp(c, 503, "无可用渠道", nil)
 			}
 			return
@@ -763,7 +770,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 				// 客户端断连 / 上游异常中断：记录但不再切换渠道（响应已锁定）
 				// 失败也落库：中断时 usage 往往拿不全，以可审计优先记失败
 				log.Printf("[relay] 渠道 id=%d SSE 转发中断: %v", ch.ID, ferr)
-				h.recordUsageFailure(ch, reqMeta.Model, upResp.StatusCode, "SSE 转发中断: "+ferr.Error())
+				h.recordUsageFailure(c, ch, reqMeta.Model, upResp.StatusCode, "SSE 转发中断: "+ferr.Error())
 			} else {
 				// W3-② 计费：优先用上游返回的 usage；缺失时估算兜底
 				//   - prompt: 上游 usage 或 请求侧估算
@@ -779,7 +786,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 				if ct == 0 {
 					ct = usage.EstimateTokens(content)
 				}
-				h.recordUsage(ch, reqMeta.Model, pt, ct)
+				h.recordUsage(c, ch, reqMeta.Model, pt, ct)
 			}
 		} else if anthropic {
 			// 非流式 + Anthropic 渠道：响应是 Anthropic 格式（content 数组 + stop_reason），
@@ -789,14 +796,14 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			if cerr != nil {
 				// 失败也落库：上游错误体不是合法 Anthropic JSON（如 4xx 错误页）→ 转换必然失败
 				log.Printf("[relay] 渠道 id=%d 非流式转换失败: %v", ch.ID, cerr)
-				h.recordUsageFailure(ch, reqMeta.Model, upResp.StatusCode, "Anthropic 响应转换失败: "+cerr.Error())
+				h.recordUsageFailure(c, ch, reqMeta.Model, upResp.StatusCode, "Anthropic 响应转换失败: "+cerr.Error())
 			} else {
 				// W3-② 计费：Anthropic usage 里 input/output tokens → prompt/completion
 				// usage 缺失时兜底：prompt 用请求估算、completion 用响应文本估算
 				if usageInfo != nil {
-					h.recordUsage(ch, reqMeta.Model, usageInfo.PromptTokens, usageInfo.CompletionTokens)
+					h.recordUsage(c, ch, reqMeta.Model, usageInfo.PromptTokens, usageInfo.CompletionTokens)
 				} else {
-					h.recordUsage(ch, reqMeta.Model, promptTokensEst, usage.EstimateTokens(respText))
+					h.recordUsage(c, ch, reqMeta.Model, promptTokensEst, usage.EstimateTokens(respText))
 				}
 			}
 		} else {
@@ -807,7 +814,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			respBody, rerr := io.ReadAll(upResp.Body)
 			if rerr != nil {
 				log.Printf("[relay] 渠道 id=%d 读取响应体失败: %v", ch.ID, rerr)
-				h.recordUsageFailure(ch, reqMeta.Model, upResp.StatusCode, "读取响应体失败: "+rerr.Error())
+				h.recordUsageFailure(c, ch, reqMeta.Model, upResp.StatusCode, "读取响应体失败: "+rerr.Error())
 			} else {
 				if _, werr := c.Writer.Write(respBody); werr != nil {
 					log.Printf("[relay] 渠道 id=%d 写回响应失败: %v", ch.ID, werr)
@@ -817,7 +824,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 				// 上游 4xx 透传给客户端 = 这次请求"失败"：记失败流水（带上游错误摘要）
 				// 200 才走计费落账；错误体摘要从 {"error":{"message":...}} 提取
 				if upResp.StatusCode >= 400 {
-					h.recordUsageFailure(ch, reqMeta.Model, upResp.StatusCode, upstreamErrorSummary(respBody))
+					h.recordUsageFailure(c, ch, reqMeta.Model, upResp.StatusCode, upstreamErrorSummary(respBody))
 					return
 				}
 				// W3-② 计费：解析 OpenAI usage（prompt_tokens/completion_tokens）
@@ -845,7 +852,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 				if pt == 0 {
 					pt = promptTokensEst
 				}
-				h.recordUsage(ch, reqMeta.Model, pt, ct)
+				h.recordUsage(c, ch, reqMeta.Model, pt, ct)
 			}
 		}
 		return
