@@ -361,20 +361,34 @@ Decrypt: hex 解码 → 拆 nonce → GCM Open（校验完整性）
 
 **② 响应侧流式 `parseSSEChunk`（双协议解析 → 统一 OpenAI 事件）**
 
-上游是 **Anthropic** 时，流里来的是这种事件（输入）：
+上游是 **Anthropic** 时，流里来的是** 6 种事件**（逐条出现，无 `[DONE]` 收尾）：
 
 ```json
-// Anthropic content_block_delta 事件
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}
+// ① message_start：会话开始（带预估用量 input_tokens=12 → 网关提取作为 prompt tokens；无增量 → 不透传正文）
+data: {"type":"message_start","message":{"id":"msg_01ABC","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet","usage":{"input_tokens":12,"output_tokens":1}}}
 
-// Anthropic message_delta 事件（流末尾）
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}
+// ② content_block_start：第一个文本块开始（无增量 → 网关跳过）
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+// ③ content_block_delta × N：逐字增量（打字机本体，网关唯一透传的正文）
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"，"}}
+
+// ④ content_block_stop：文本块结束（无增量 → 网关跳过）
+data: {"type":"content_block_stop","index":0}
+
+// ⑤ message_delta：结束原因 + 顶层 usage.output_tokens=10（最终生成量 → 网关提取作为 completion tokens）
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":10}}
+
+// ⑥ message_stop：会话结束（对应 OpenAI 的 [DONE]；无增量 → 网关跳过）
+data: {"type":"message_stop"}
 ```
 
-网关写给客户端的（输出，统一 OpenAI 格式）：
+网关写给客户端的（输出，统一 OpenAI 格式）——6 种里只有 ③ 和 ⑤ 产生输出：
 
 ```json
 data: {"choices":[{"index":0,"delta":{"content":"你好"}}]}
+data: {"choices":[{"index":0,"delta":{"content":"，"}}]}
 
 data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 ```
@@ -389,6 +403,7 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 | 4   | `stop_reason: max_tokens`                                                       | `finish_reason: length`     | 输出截断                               |
 | 5   | `stop_reason: tool_use`                                                         | `finish_reason: tool_calls` | 工具调用                               |
 | 6   | `message_start` / `content_block_start` / `content_block_stop` / `message_stop` | 无输出（跳过）                     | 无增量事件，不透传                          |
+| 7   | `message_start.usage.input_tokens` + `message_delta.usage.output_tokens`        | 合并成完整 usage（透传末尾 + 计费用）   | Anthropic 用量分散两条事件：`parseSSEChunk` 各取一段，`forwardSSE` 用 `mergeSSEUsage` 拼成 `{12,10,22}`；message_start 的 `output_tokens` 是预估上限**忽略**，只信 message_delta 的真实值；流末补发一条完整 usage 事件覆盖中间的半对值 |
 
 解析流程：先探测 `type` 字段（有 = Anthropic 事件，无 = OpenAI 格式）→ 提取增量 →
 统一塞进语义层 `sseChunk{index, content, finishReason, usage}` → `render()` 重组成上面的 OpenAI 事件。
@@ -461,11 +476,43 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 三个技术点（面试必讲）：
 
-1. **拆包缓冲**：TCP 流可能把一条 SSE 事件（`data: ...\n\n`）拆成两段到达，
-   `bufio.Reader.ReadBytes('\n')` 没读到 `\n` 就继续攒——天然处理跨包事件；
-   攒到**空行**（`\n\n`）才算一条完整事件。
-2. **增量映射**：解析 `data:` 里的 JSON，只搬 `delta.content` / `finish_reason` / `usage`；
-   Anthropic 的 `message_start` 等无增量事件直接跳过，不透传给客户端。
+1. **拆包缓冲（TCP 字节流 → 按空行切事件）**：
+
+   TCP 是**字节流，没有消息边界**——上游写进连接的一串字节，到达网关时会被网络栈
+   任意切成若干包：一条事件可能被拆成两段（拆包）、多条事件可能粘在一起同时到（粘包）。
+   SSE 协议的边界约定是**空行（`\n\n`）**：`data: {...}` 一行 + 一个空行 = 一条事件。
+
+   ```go
+   reader := bufio.NewReader(upResp.Body) // 带缓冲读取器
+   var event []byte                        // 攒包缓冲
+   for {
+       line, _ := reader.ReadBytes('\n')   // 读到 \n 才返回一行；半行到达则阻塞等下一段
+       event = append(event, line...)      // 拼进缓冲
+       if len(bytes.TrimSpace(line)) == 0 { // 空行 = 一条事件完整了
+           handleSSEEvent(c, event)        // 切出这条事件去解析/转换
+           event = event[:0]               // 清空（复用底层数组，避免流式高频分配）
+       }
+   }
+   ```
+
+   效果：**拆包不丢**（半行会一直攒到补完整行）、**粘包不乱**（攒够空行才切一条，
+   多余字节留到下轮继续攒）。这是 SSE 客户端/网关的标配处理，面试可直接讲这个循环。
+2. **增量映射（双协议 → 统一语义层 `sseChunk`）**：
+   解析 `data:` 里的 JSON，**只搬三类字段**：增量文本 / 结束原因 / 用量，
+   其余 JSON 骨架（id、index、type、role 等）一律丢弃，重组成 OpenAI 格式再写回。
+
+   | 源事件 | 提取 | 去往 |
+   |---|---|---|
+   | OpenAI `delta.content` | 增量文本 | `sseChunk.content` → `delta.content` |
+   | OpenAI `finish_reason` | 结束原因 | `sseChunk.finishReason`（原样透传） |
+   | OpenAI `usage` | 完整用量（单条） | `sseChunk.usage`（透传 + 计费） |
+   | Anthropic `content_block_delta.delta.text` | 增量文本 | `sseChunk.content` → `delta.content` |
+   | Anthropic `message_delta.delta.stop_reason` | 结束原因 | 经 `mapAnthropicStopReason` 映射 |
+   | Anthropic `message_start.usage.input_tokens` + `message_delta.usage.output_tokens` | 用量**两段分散** | `mergeSSEUsage` 合并成完整 usage（计费 + 流末补发） |
+
+   **哪些事件被跳过**：`content_block_start` / `content_block_stop` / `message_stop`
+   ——无增量、无用量，返回空 chunk，不透传给客户端；`message_start` 不透传正文，
+   但提取 input_tokens 用于计费（其 output_tokens 是预估上限，**忽略**）。
 3. **半途断连**：客户端断开 → 写入报错 → 停止读取，上游的 context 随之取消（链路自动回收）。
 
 另外两个协议补齐：
@@ -564,7 +611,7 @@ PEXPIRE key window+1000             -- 防 key 永不删除
 
 | 分支 | usage 来源 | 缺失兜底 |
 |---|---|---|
-| SSE 流式 | `forwardSSE` 捕获末尾 usage 事件 + 累计增量文本 | completion 按累计文本估算、prompt 按请求文本估算 |
+| SSE 流式 | `forwardSSE` 合并 usage：OpenAI 单条事件 / **Anthropic 的 message_start(input)+message_delta(output) 两段合并** | completion 按累计文本估算、prompt 按请求文本估算（两者都拿不到 usage 时才兜底） |
 | 非流式 OpenAI | 解析响应体 `usage` | completion 按 `choices[0].message.content` 纯文本估算 |
 | 非流式 Anthropic | 转换返回 `input/output_tokens` | completion 按响应文本估算 |
 
@@ -621,16 +668,24 @@ PEXPIRE key window+1000             -- 防 key 永不删除
 **中间件 `AccessKeyAuth`（gin.HandlerFunc，返回函数给路由注册）：**
 
 ```
-客户端 Bearer sk_lgw_xxx
-  → hashAccessKey(plain)  // SHA-256
-  → db 查 key_hash
-  → 命中 && enabled → 注入 c.Set("ak", {id,name,scopes})
-  → 未命中 / 停用 → 401（且失败也落库，见第 15 节）
+请求进入
+  → parseRequestModel(c)  // 偷看 body 里的 model（读完恢复 body，relay 还能再读）
+  → modelProtected(db, modelName)?  // 该模型是否被任一启用 Key 的 scopes 覆盖
+      ├─ 否（未受保护模型）→ 匿名放行 → Next()
+      └─ 是 → 有 Bearer 吗？
+            ├─ 无 → 401（且失败也落库）
+            └─ 有 → hashAccessKey(plain) → db 查 key_hash
+                  ├─ 未命中 / 停用 → 401（且失败也落库）
+                  └─ 命中 && enabled → 注入 c.Set("ak", {id,name,scopes})
+                        → scope 模型校验：scopes 空/"*"=全放行；
+                          否则请求 model 不在 scopes → 403（落库带越权 key 身份）
+                        → 放行 → Next()
 ```
 
 **模型级鉴权语义（面试必讲）**：`scopes` 覆盖的模型要求 Bearer；
 未被任何启用 Key 覆盖的模型允许匿名（裸测通道）；但**凭证无效一律 401**
-（不能因为"这个模型开放匿名"就放行坏 Key——那是认证绕过）。
+（不能因为"这个模型开放匿名"就放行坏 Key——那是认证绕过）；
+**凭证有效但越权（model 不在 scopes 里）一律 403**——401 是"你是谁"，403 是"你无权干这个"。
 限流维度用鉴权后的 `ak:{id}`（可信身份），匿名才退化为 IP。
 
 ### 14. 限流次数 Web 动态设置（settings 持久化）

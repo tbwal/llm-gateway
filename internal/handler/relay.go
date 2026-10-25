@@ -415,6 +415,26 @@ func parseSSEChunk(data string) (*sseChunk, error) {
 	// ② Anthropic 事件分支
 	if probe.Type != "" {
 		switch probe.Type {
+		case "message_start":
+			// message: {"usage":{"input_tokens":12,"output_tokens":1}}
+			// input_tokens 是真实输入量；output_tokens 是"预计上限"（近似 max_tokens），
+			// 不是最终生成量 → 只取 input，output 等 message_delta 的真实值
+			var m struct {
+				Message struct {
+					Usage struct {
+						InputTokens int `json:"input_tokens"`
+					} `json:"usage"`
+				} `json:"message"`
+			}
+			if err := json.Unmarshal([]byte(data), &m); err != nil {
+				return nil, err
+			}
+			if m.Message.Usage.InputTokens > 0 {
+				chunk.usage = &sseUsage{
+					PromptTokens: m.Message.Usage.InputTokens,
+					TotalTokens:  m.Message.Usage.InputTokens,
+				}
+			}
 		case "content_block_delta":
 			// delta: {"type":"text_delta","text":"你好"}
 			// 只认文本增量；tool_use 等其他类型暂无增量（将来扩展）
@@ -429,14 +449,25 @@ func parseSSEChunk(data string) (*sseChunk, error) {
 				chunk.content = d.Text
 			}
 		case "message_delta":
-			// delta: {"stop_reason":"end_turn","stop_sequence":null}
+			// delta: {"stop_reason":"end_turn","stop_sequence":null} + 顶层 usage.output_tokens（最终生成量）
 			var d struct {
-				StopReason string `json:"stop_reason"`
+				Delta struct {
+					StopReason string `json:"stop_reason"`
+				} `json:"delta"`
+				Usage struct {
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
 			}
-			if err := json.Unmarshal(probe.Delta, &d); err != nil {
+			if err := json.Unmarshal([]byte(data), &d); err != nil {
 				return nil, err
 			}
-			chunk.finishReason = mapAnthropicStopReason(d.StopReason)
+			chunk.finishReason = mapAnthropicStopReason(d.Delta.StopReason)
+			if d.Usage.OutputTokens > 0 {
+				chunk.usage = &sseUsage{
+					CompletionTokens: d.Usage.OutputTokens,
+					TotalTokens:      d.Usage.OutputTokens,
+				}
+			}
 		}
 		// message_start / content_block_start / content_block_stop / message_stop：
 		// 不产生增量，返回空 chunk（由 handleSSEEvent 跳过，不写回客户端）
@@ -565,6 +596,23 @@ func handleSSEEvent(c *gin.Context, event []byte) (*sseChunk, bool, error) {
 	return chunk, false, nil
 }
 
+// mergeSSEUsage 合并两段 usage：Anthropic 流的用量分散在两条事件里——
+// message_start 带 input_tokens、message_delta 带 output_tokens，各取非零段拼成完整用量。
+// OpenAI 单条事件自带完整 usage（三字段齐全），直接覆盖语义不受影响（取非零即原值）。
+func mergeSSEUsage(dst, src *sseUsage) *sseUsage {
+	if dst == nil {
+		return src
+	}
+	if src.PromptTokens > 0 {
+		dst.PromptTokens = src.PromptTokens
+	}
+	if src.CompletionTokens > 0 {
+		dst.CompletionTokens = src.CompletionTokens
+	}
+	dst.TotalTokens = dst.PromptTokens + dst.CompletionTokens
+	return dst
+}
+
 // forwardSSE 逐事件消费上游 SSE 流，边收边转边推
 //
 // 核心：按行读、按空行切事件、攒够一条处理一条。
@@ -572,14 +620,14 @@ func handleSSEEvent(c *gin.Context, event []byte) (*sseChunk, bool, error) {
 //
 // 返回值（W3-② 计费用）：
 //   content 累计的全部增量文本（usage 缺失时按它估算 completion tokens）
-//   usage   流末尾 usage 事件的真实用量（可能为 nil：上游没返回 usage）
+//   usage   流末尾合并后的真实用量（可能为 nil：上游没返回 usage）
 //   error   转发过程中的错误
-func forwardSSE(c *gin.Context, upResp *http.Response) (string, *sseUsage, error) {
+func forwardSSE(c *gin.Context, upResp *http.Response, isAnthropic bool) (string, *sseUsage, error) {
 	reader := bufio.NewReader(upResp.Body)
 	var event []byte   // 当前事件的缓冲（跨块攒）
 	sentDone := false  // 是否已向客户端发过 [DONE]（OpenAI 上游自带；Anthropic 上游没有，EOF 时补）
 	var content strings.Builder // 累计增量文本（计费估算兜底）
-	var usage *sseUsage         // 捕获流末尾的 usage 事件（一般只有一条）
+	var usage *sseUsage         // 合并后的 usage（OpenAI 单条事件覆盖；Anthropic 两段合并）
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
@@ -590,10 +638,10 @@ func forwardSSE(c *gin.Context, upResp *http.Response) (string, *sseUsage, error
 					return content.String(), usage, herr
 				}
 				sentDone = sentDone || done
-				if chunk != nil { // 累计增量 + 捕获 usage（chunk 可能为空：无增量事件）
+				if chunk != nil { // 累计增量 + 合并 usage（chunk 可能为空：无增量事件）
 					content.WriteString(chunk.content)
 					if chunk.usage != nil {
-						usage = chunk.usage
+						usage = mergeSSEUsage(usage, chunk.usage)
 					}
 				}
 				event = event[:0] // 清空缓冲，等下一条
@@ -616,7 +664,17 @@ func forwardSSE(c *gin.Context, upResp *http.Response) (string, *sseUsage, error
 		if chunk != nil {
 			content.WriteString(chunk.content)
 			if chunk.usage != nil {
-				usage = chunk.usage
+				usage = mergeSSEUsage(usage, chunk.usage)
+			}
+		}
+	}
+	// Anthropic 流：usage 分散在 message_start（input）与 message_delta（output）里，
+	// 客户端一路上收到的是两条"半对"的 usage 事件 → 流结束时补发一条完整 usage 覆盖
+	// （OpenAI 上游自带独立完整 usage 事件，已透传，无需补发）
+	if isAnthropic && usage != nil && (usage.PromptTokens > 0 || usage.CompletionTokens > 0) {
+		if b, jerr := json.Marshal(map[string]any{"usage": usage}); jerr == nil {
+			if _, werr := io.WriteString(c.Writer, "data: "+string(b)+"\n\n"); werr == nil {
+				flushWriter(c)
 			}
 		}
 	}
@@ -816,7 +874,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 
 		if strings.Contains(upResp.Header.Get("Content-Type"), "text/event-stream") {
 			log.Printf("[relay] 渠道 id=%d SSE 流式响应，进入增量转换", ch.ID)
-			content, usageInfo, ferr := forwardSSE(c, upResp)
+			content, usageInfo, ferr := forwardSSE(c, upResp, isAnthropicProvider(ch.Provider))
 			if ferr != nil {
 				// 客户端断连 / 上游异常中断：记录但不再切换渠道（响应已锁定）
 				// 失败也落库：中断时 usage 往往拿不全，以可审计优先记失败

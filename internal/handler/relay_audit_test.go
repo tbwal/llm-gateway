@@ -107,3 +107,57 @@ func TestRelayAuditFields(t *testing.T) {
 		t.Fatalf("first_response_ms = %d, want > 0（非流式首响应应被 mark）", entry.FirstResponseMs)
 	}
 }
+
+// TestParseAnthropicSSEUsage Anthropic 流式 usage 解析 + 合并：
+// usage 分散在 message_start（input_tokens）与 message_delta（output_tokens）两条事件里，
+// parseSSEChunk 各取一段，mergeSSEUsage 拼成完整 {12,10,22}——计费不再走估算兜底
+func TestParseAnthropicSSEUsage(t *testing.T) {
+	// ① message_start：提取真实输入量（output_tokens 是预估上限，忽略）
+	chunk, err := parseSSEChunk(`{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-3-5-sonnet","usage":{"input_tokens":12,"output_tokens":1}}}`)
+	if err != nil {
+		t.Fatalf("parseSSEChunk(message_start) err = %v", err)
+	}
+	if chunk.usage == nil || chunk.usage.PromptTokens != 12 {
+		t.Fatalf("message_start usage = %+v, want PromptTokens=12", chunk.usage)
+	}
+	if chunk.content != "" || chunk.finishReason != "" {
+		t.Fatalf("message_start 不应产生增量，got content=%q finish=%q", chunk.content, chunk.finishReason)
+	}
+
+	// ② content_block_delta：增量文本，不带 usage
+	chunk, err = parseSSEChunk(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好"}}`)
+	if err != nil {
+		t.Fatalf("parseSSEChunk(delta) err = %v", err)
+	}
+	if chunk.content != "你好" || chunk.usage != nil {
+		t.Fatalf("content_block_delta = content=%q usage=%+v, want 你好/nil", chunk.content, chunk.usage)
+	}
+
+	// ③ message_delta：结束原因 + 顶层 usage.output_tokens（最终生成量）
+	chunk, err = parseSSEChunk(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":10}}`)
+	if err != nil {
+		t.Fatalf("parseSSEChunk(message_delta) err = %v", err)
+	}
+	if chunk.finishReason != "stop" {
+		t.Fatalf("message_delta finishReason = %q, want stop", chunk.finishReason)
+	}
+	if chunk.usage == nil || chunk.usage.CompletionTokens != 10 {
+		t.Fatalf("message_delta usage = %+v, want CompletionTokens=10", chunk.usage)
+	}
+
+	// ④ 合并：message_start 的 input + message_delta 的 output → 完整用量
+	merged := mergeSSEUsage(&sseUsage{PromptTokens: 12, TotalTokens: 12},
+		&sseUsage{CompletionTokens: 10, TotalTokens: 10})
+	if merged.PromptTokens != 12 || merged.CompletionTokens != 10 || merged.TotalTokens != 22 {
+		t.Fatalf("mergeSSEUsage = %+v, want {12,10,22}", merged)
+	}
+
+	// ⑤ 非 Anthropic 事件（message_stop）不产生 usage
+	chunk, err = parseSSEChunk(`{"type":"message_stop"}`)
+	if err != nil {
+		t.Fatalf("parseSSEChunk(message_stop) err = %v", err)
+	}
+	if chunk.usage != nil || chunk.content != "" || chunk.finishReason != "" {
+		t.Fatalf("message_stop 不应有任何内容，got %+v", chunk)
+	}
+}
