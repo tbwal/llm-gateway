@@ -26,8 +26,15 @@ func TestRelayAuditFields(t *testing.T) {
 	}
 
 	// mock 上游：OpenAI 非流式 JSON，带 usage（能走到计费落库分支）
+	// 先发响应头、sleep 20ms 再发 body：制造"响应头先到、内容慢发"——
+	// 首响应延迟（mark 于 Do 返回 = 头到达）才有稳定非零值可断言
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(20 * time.Millisecond)
 		fmt.Fprintf(w, `{"id":"cmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
 	}))
 	defer upstream.Close()
@@ -91,5 +98,12 @@ func TestRelayAuditFields(t *testing.T) {
 	}
 	if entry.PromptTokens != 2 || entry.CompletionTokens != 1 {
 		t.Fatalf("tokens = %d+%d, want 2+1（上游 usage 解析）", entry.PromptTokens, entry.CompletionTokens)
+	}
+	// ③ 耗时字段：成功请求必须有总耗时 + 首响应延迟（非流式 = 开始写回响应体）
+	if entry.DurationMs <= 0 {
+		t.Fatalf("duration_ms = %d, want > 0", entry.DurationMs)
+	}
+	if entry.FirstResponseMs <= 0 {
+		t.Fatalf("first_response_ms = %d, want > 0（非流式首响应应被 mark）", entry.FirstResponseMs)
 	}
 }

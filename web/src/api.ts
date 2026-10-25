@@ -239,6 +239,8 @@ export interface UsageLogItem {
   cost: number
   status?: number // 失败也落库：200=成功，4xx/5xx=失败
   error?: string // 失败时的错误摘要（成功为空）
+  duration_ms?: number // 网关总耗时（毫秒）
+  first_response_ms?: number // 首响应延迟（流式=首个 token；非流式=上游响应到达）
   created_at: string
 }
 

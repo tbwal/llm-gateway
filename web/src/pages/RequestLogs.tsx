@@ -115,6 +115,12 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
     return `${md} ${hm}`
   }
   const fmtCost = (v: number) => (v > 0 ? `¥${v.toFixed(4)}` : '—')
+  // 耗时格式化：<1s 显示毫秒，≥1s 显示秒；0ms（本地毫秒内完成）显示 <1ms
+  const fmtDur = (ms?: number) => {
+    if (ms == null || ms < 0) return '—'
+    if (ms === 0) return '<1ms'
+    return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
+  }
   // 状态徽标：无 status（旧数据）显示 —；2xx 绿；4xx 黄；5xx 红
   const statusColor = (s?: number) =>
     s == null || s === 0
@@ -126,8 +132,11 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
           : 'var(--danger)'
 
   return (
-    <div>
-      <h2>请求日志</h2>
+    // 突破 app-shell 的 1200px 限制：日志表格列多（14 列），窄容器里挤成竖条。
+    // 外层用负 margin 溢出到视口，内层限 1440px 居中——比 1200 宽 240px，但不满屏
+    <div style={{ marginLeft: 'calc(50% - 50vw)', marginRight: 'calc(50% - 50vw)', padding: '0 24px' }}>
+      <div style={{ maxWidth: 1440, margin: '0 auto' }}>
+        <h2>请求日志</h2>
       <p className="subtitle">
         usage_logs 流水明细 · 每次请求一条记录，可审计可追溯 · 数据源 /api/usage/logs
       </p>
@@ -267,6 +276,7 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>模型</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>Provider</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>状态</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>耗时</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>错误</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>输入</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>输出</th>
@@ -321,6 +331,18 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
                     >
                       {it.status == null || it.status === 0 ? '—' : `HTTP ${it.status}`}
                     </span>
+                  </td>
+                  <td style={{ padding: '9px 8px', whiteSpace: 'nowrap', fontSize: 11.5, fontVariantNumeric: 'tabular-nums' }} title={it.duration_ms != null && it.first_response_ms != null ? `总耗时 ${it.duration_ms}ms · 首响应 ${it.first_response_ms}ms` : undefined}>
+                    {it.duration_ms != null && it.duration_ms > 0 ? (
+                      <>
+                        <span style={{ color: 'var(--text-primary)', fontWeight: 600 }}>{fmtDur(it.duration_ms)}</span>
+                        {it.first_response_ms != null && (
+                          <span className="muted" style={{ marginLeft: 6 }}>首 {fmtDur(it.first_response_ms)}</span>
+                        )}
+                      </>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
                   </td>
                   <td style={{ padding: '9px 8px', maxWidth: 170 }}>
                     <span
@@ -380,6 +402,7 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
             </button>
           </div>
         </div>
+      </div>
       </div>
     </div>
   )

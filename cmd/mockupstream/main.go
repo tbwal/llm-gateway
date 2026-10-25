@@ -121,7 +121,11 @@ func handleStream(w http.ResponseWriter) {
 		return
 	}
 
-	// ③ 逐个词推送，模拟大模型逐字生成
+	// ③ 先"思考"再开口：首个 token 前 sleep，模拟真实模型的生成延迟
+	//    （否则本地回环首 token <1ms，网关的 TTFT 指标取整成 0，无法观测）
+	time.Sleep(200 * time.Millisecond)
+
+	// ④ 逐个词推送，模拟大模型逐字生成
 	tokens := []string{"你好", "，", "我", "是", "流式", "回复", "，", "打字机", "效果", "！"}
 	for _, token := range tokens {
 		// SSE 数据块：data: {"choices":[{"delta":{"content":"..."}}]}
@@ -132,7 +136,7 @@ func handleStream(w http.ResponseWriter) {
 		time.Sleep(200 * time.Millisecond) // 模拟大模型"思考+生成"的耗时
 	}
 
-	// ④ 流结束前，OpenAI 真实上游会先发两条元数据：
+	// ⑤ 流结束前，OpenAI 真实上游会先发两条元数据：
 	//    - finish_reason：本轮生成结束的原因（stop / length / tool_calls）
 	//    - usage：用量统计（部分上游放在最后一条事件）
 	//    网关的 SSE 增量转换要能透传它们（relay.go 的 parseSSEChunk/render）
@@ -241,6 +245,8 @@ func handleMessagesStream(w http.ResponseWriter) {
 		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
 
 	// ⑤ content_block_delta × N：逐字增量（打字机本体）
+	//    先"思考"再开口：首个 delta 前 sleep，让网关的 TTFT 可观测（本地回环否则 <1ms 取整 0）
+	time.Sleep(200 * time.Millisecond)
 	tokens := []string{"你好", "，", "我", "是", "流式", "回复", "，", "打字机", "效果", "！"}
 	for _, token := range tokens {
 		sseEvent("content_block_delta",

@@ -32,5 +32,7 @@ type UsageLog struct {
 	Status int `gorm:"index" json:"status,omitempty"`
 	// Error 失败时的错误摘要（成功为空）；上限 500 字防撑爆表
 	Error     string    `gorm:"size:500" json:"error,omitempty"`
+	DurationMs      int64     `json:"duration_ms"`        // 网关总耗时（请求进入 → 落库），毫秒；排障"慢"用
+	FirstResponseMs int64     `json:"first_response_ms"`  // 首响应延迟：流式=首个增量 token；非流式=开始写回响应体（≈ TTFT）
 	CreatedAt time.Time `json:"created_at"` // GORM 自动填
 }

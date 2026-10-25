@@ -100,6 +100,46 @@ func auditMeta(c *gin.Context) (reqID string, akID uint, akName string, ip strin
 	return RequestIDFromCtx(c), AccessKeyFromCtxID(c), AccessKeyNameFromCtx(c), c.ClientIP()
 }
 
+// relayStartKey / relayFirstRespKey 请求计时存 context 的 key
+const (
+	relayStartKey      = "relayStart"
+	relayFirstRespKey  = "relayFirstResp"
+)
+
+// markFirstResponse 记录"首响应"时刻（只记一次）
+// 流式 = 首个增量 token 写出；非流式 = 上游响应到达（Do 返回）。
+// ⚠️ 存的是"入口 → 首 token"的毫秒差值（TTFT），不是时间点——
+//    fallback：先掏 start 算 time.Since，存 int64。失败分支不调用（首响应=0）
+func markFirstResponse(c *gin.Context) {
+	if _, ok := c.Get(relayFirstRespKey); !ok {
+		var ttftMs int64
+		if v, ok := c.Get(relayStartKey); ok {
+			if t, ok := v.(time.Time); ok {
+				ttftMs = time.Since(t).Milliseconds()
+			}
+		}
+		c.Set(relayFirstRespKey, ttftMs)
+	}
+}
+
+// relayTiming 从 context 取请求计时：
+//   durationMs   总耗时（入口 → 落库时刻，毫秒）
+//   firstRespMs  TTFT（入口 → 首 token/首响应，毫秒）——mark 时已算好存差值
+// 两者差 = 首 token 之后到请求结束的时间（后续生成 + 传输），可定位"慢在哪一段"
+func relayTiming(c *gin.Context) (durationMs, firstRespMs int64) {
+	if v, ok := c.Get(relayStartKey); ok {
+		if t, ok := v.(time.Time); ok {
+			durationMs = time.Since(t).Milliseconds()
+		}
+	}
+	if v, ok := c.Get(relayFirstRespKey); ok {
+		if d, ok := v.(int64); ok {
+			firstRespMs = d
+		}
+	}
+	return durationMs, firstRespMs
+}
+
 // recordUsage W3-② 计费落库：把一次请求的 token 用量写成流水
 //
 // 设计原则（面试讲点）：**流水表 + 查询时聚合**
@@ -113,6 +153,7 @@ func (h *RelayHandler) recordUsage(c *gin.Context, ch model.Channel, modelName s
 	}
 	cost := usage.CalcCost(modelName, promptTokens, completionTokens)
 	reqID, akID, akName, ip := auditMeta(c)
+	durationMs, firstRespMs := relayTiming(c)
 	logEntry := model.UsageLog{
 		RequestID:        reqID,
 		ChannelID:        ch.ID,
@@ -127,6 +168,8 @@ func (h *RelayHandler) recordUsage(c *gin.Context, ch model.Channel, modelName s
 		TotalTokens:      promptTokens + completionTokens,
 		Cost:             cost,
 		Status:           200, // 能走到落账 = 转发成功（HTTP 200 语义）
+		DurationMs:       durationMs,
+		FirstResponseMs:  firstRespMs,
 	}
 	if err := h.db.Create(&logEntry).Error; err != nil {
 		log.Printf("[usage] 计费落库失败: %v", err)
@@ -138,17 +181,20 @@ func (h *RelayHandler) recordUsage(c *gin.Context, ch model.Channel, modelName s
 // logUsageFailure 包级失败落库（relay 转发链路与 AccessKeyAuth 中间件共用）
 func logUsageFailure(db *gorm.DB, c *gin.Context, ch model.Channel, modelName string, status int, errMsg string) {
 	reqID, akID, akName, ip := auditMeta(c)
+	durationMs, firstRespMs := relayTiming(c)
 	logEntry := model.UsageLog{
-		RequestID:     reqID,
-		ChannelID:     ch.ID,
-		ChannelName:   ch.Name,
-		Provider:      ch.Provider,
-		Model:         modelName,
-		AccessKeyID:   akID,
-		AccessKeyName: akName,
-		ClientIP:      ip,
-		Status:        status,
-		Error:         errMsg,
+		RequestID:        reqID,
+		ChannelID:        ch.ID,
+		ChannelName:      ch.Name,
+		Provider:         ch.Provider,
+		Model:            modelName,
+		AccessKeyID:      akID,
+		AccessKeyName:    akName,
+		ClientIP:         ip,
+		Status:           status,
+		Error:            errMsg,
+		DurationMs:       durationMs,
+		FirstResponseMs:  firstRespMs, // 失败分支未 mark → 0（语义：没等到任何响应）
 	}
 	if err := db.Create(&logEntry).Error; err != nil {
 		log.Printf("[usage] 失败落库失败: %v", err)
@@ -510,6 +556,8 @@ func handleSSEEvent(c *gin.Context, event []byte) (*sseChunk, bool, error) {
 	}
 
 	// ⑤ 增量转换：按 OpenAI 格式重组写回 + 立即 Flush（保打字机效果）
+	//    首个有内容的增量 = 首 token 时刻（TTFT），只记一次
+	markFirstResponse(c)
 	if _, err := c.Writer.Write(chunk.render()); err != nil {
 		return chunk, false, err // 客户端断连会在这里报错 → 上游 context 随之取消
 	}
@@ -598,6 +646,9 @@ func flushWriter(c *gin.Context) {
 //	             └────── 转发请求 ──────┘
 //	             ←────── 带回响应 ──────┘
 func (h *RelayHandler) ChatCompletions(c *gin.Context) {
+	// 计时起点：请求一进来就记（限流/鉴权失败也算总耗时的一部分）
+	c.Set(relayStartKey, time.Now())
+
 	// ⓪ W3 限流：在解析 body 之前先掐住（省得为被拒绝的请求白做 JSON 解析）
 	// key 取调用方标识（Authorization Bearer / X-User-Key），兜底客户端 IP
 	if h.limiter != nil {
@@ -791,6 +842,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		} else if anthropic {
 			// 非流式 + Anthropic 渠道：响应是 Anthropic 格式（content 数组 + stop_reason），
 			// 客户端（OpenAI SDK）不认——必须转成 OpenAI 格式再写回
+			markFirstResponse(c) // 首响应 = 上游响应已到达（Do 返回，含上游生成时间）
 			log.Printf("[relay] 渠道 id=%d 非流式响应，Anthropic → OpenAI 转换", ch.ID)
 			usageInfo, respText, cerr := convertAnthropicOnce(c, upResp)
 			if cerr != nil {
@@ -811,6 +863,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			// ⚠️ 为什么这里改成"读完再写"而不是 io.Copy 边读边写：
 			//    计费需要解析响应体里的 usage；普通 JSON 响应体一般不大，
 			//    读进内存的开销可接受（SSE 才必须流式，这里不流式）
+			markFirstResponse(c) // 首响应 = 上游响应已到达（Do 返回，含上游生成时间）
 			respBody, rerr := io.ReadAll(upResp.Body)
 			if rerr != nil {
 				log.Printf("[relay] 渠道 id=%d 读取响应体失败: %v", ch.ID, rerr)
