@@ -164,11 +164,14 @@ func since(days int) time.Time {
 
 // ---------- Logs：请求日志（流水明细） ----------
 
-// Logs GET /api/usage/logs?page=1&page_size=20&model=&channel_id=&provider=&days=
+// Logs GET /api/usage/logs?page=1&page_size=20&model=&channel_id=&provider=&request_id=&days=
 // 请求日志 = 流水表原样分页，不做聚合——每行一条真实请求记录，可审计可追溯。
 // 参数：
 //   page/page_size  分页（默认 1 / 20，page_size 上限 100）
 //   model/channel_id/provider  精确筛选（逗号分隔的 model 可传多个？保持单值，够用）
+//   request_id      按链路 ID 精确筛选（排障：输入 req_xxx 拉出该请求的全部记录）
+//   access_key_name 按调用方名称精确筛选（如 audit-user；匿名请留空 = 不筛）
+//   client_ip       按客户端 IP 精确筛选（如 ::1 / 127.0.0.1）
 //   days            时间范围（不传 = 全部历史；1~365）
 func (d *UsageDashboard) Logs(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -191,6 +194,15 @@ func (d *UsageDashboard) Logs(c *gin.Context) {
 	}
 	if m := strings.TrimSpace(c.Query("model")); m != "" {
 		q = q.Where("model = ?", m)
+	}
+	if rid := strings.TrimSpace(c.Query("request_id")); rid != "" {
+		q = q.Where("request_id = ?", rid)
+	}
+	if ak := strings.TrimSpace(c.Query("access_key_name")); ak != "" {
+		q = q.Where("access_key_name = ?", ak)
+	}
+	if ip := strings.TrimSpace(c.Query("client_ip")); ip != "" {
+		q = q.Where("client_ip = ?", ip)
 	}
 	if ch := strings.TrimSpace(c.Query("channel_id")); ch != "" {
 		if n, err := strconv.Atoi(ch); err == nil {

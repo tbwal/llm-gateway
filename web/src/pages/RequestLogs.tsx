@@ -9,6 +9,49 @@ import { Icon } from '../components/Icon'
 const PAGE_SIZES = [10, 20, 50]
 const PROVIDERS = ['openai', 'anthropic', 'deepseek']
 
+/** 复制按钮：hover 所在单元格时显示，点击复制，1.5s 内显示 ✓ 反馈
+ *  显隐由 CSS 控制：.req-copy-cell:hover 显示；复制成功加 .req-copied 常显 */
+function CopyBtn({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      // 非 https/localhost 环境下 clipboard API 不可用：textarea 兜底
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+  return (
+    <button
+      onClick={copy}
+      title={`复制 ${label}`}
+      aria-label={`复制 ${label}`}
+      className={`req-copy-btn${copied ? ' req-copied' : ''}`}
+      style={{
+        border: 'none',
+        background: 'none',
+        padding: 2,
+        cursor: copied ? 'default' : 'pointer',
+        color: copied ? 'var(--ok)' : 'var(--text-muted)',
+        display: 'inline-flex',
+        alignItems: 'center',
+        flexShrink: 0,
+      }}
+    >
+      <Icon name={copied ? 'check' : 'copy'} size={12.5} />
+    </button>
+  )
+}
+
 export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
   const [items, setItems] = useState<UsageLogItem[]>([])
   const [total, setTotal] = useState(0)
@@ -22,6 +65,9 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
   const [fModel, setFModel] = useState('')
   const [fChannel, setFChannel] = useState('')
   const [fProvider, setFProvider] = useState('')
+  const [fRequestID, setFRequestID] = useState('')
+  const [fAccessKey, setFAccessKey] = useState('')
+  const [fClientIP, setFClientIP] = useState('')
   const [fDays, setFDays] = useState('7')
 
   const load = useCallback(async () => {
@@ -34,6 +80,9 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
         model: fModel.trim() || undefined,
         channel_id: fChannel ? Number(fChannel) : undefined,
         provider: fProvider || undefined,
+        request_id: fRequestID.trim() || undefined,
+        access_key_name: fAccessKey.trim() || undefined,
+        client_ip: fClientIP.trim() || undefined,
         days: fDays ? Number(fDays) : undefined,
       })
       setItems(data.items)
@@ -43,7 +92,7 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, fModel, fChannel, fProvider, fDays])
+  }, [page, pageSize, fModel, fChannel, fProvider, fRequestID, fAccessKey, fClientIP, fDays])
 
   useEffect(() => {
     load()
@@ -94,6 +143,45 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
               value={fModel}
               onChange={(e) => {
                 setFModel(e.target.value)
+                setPage(1)
+              }}
+              style={{ width: 130 }}
+            />
+          </div>
+          <div>
+            <div className="muted" style={{ marginBottom: 4 }}>链路 ID</div>
+            <input
+              className="glass-input"
+              placeholder="req_xxx 精确查"
+              value={fRequestID}
+              onChange={(e) => {
+                setFRequestID(e.target.value)
+                setPage(1)
+              }}
+              style={{ width: 150 }}
+            />
+          </div>
+          <div>
+            <div className="muted" style={{ marginBottom: 4 }}>调用方</div>
+            <input
+              className="glass-input"
+              placeholder="如 audit-user / 匿名"
+              value={fAccessKey}
+              onChange={(e) => {
+                setFAccessKey(e.target.value)
+                setPage(1)
+              }}
+              style={{ width: 130 }}
+            />
+          </div>
+          <div>
+            <div className="muted" style={{ marginBottom: 4 }}>IP</div>
+            <input
+              className="glass-input"
+              placeholder="如 ::1 / 127.0.0.1"
+              value={fClientIP}
+              onChange={(e) => {
+                setFClientIP(e.target.value)
                 setPage(1)
               }}
               style={{ width: 140 }}
@@ -190,12 +278,15 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
               {items.map((it) => (
                 <tr key={it.id} style={{ borderBottom: '1px solid var(--border)' }}>
                   <td style={{ padding: '9px 8px', whiteSpace: 'nowrap', color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums' }}>{fmtTime(it.created_at)}</td>
-                  <td style={{ padding: '9px 8px', maxWidth: 96 }}>
-                    <span
-                      style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-secondary)', fontSize: 11.5, fontVariantNumeric: 'tabular-nums' }}
-                      title={it.request_id}
-                    >
-                      {it.request_id || '—'}
+                  <td style={{ padding: '9px 8px', maxWidth: 112 }}>
+                    <span className="req-copy-cell" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span
+                        style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-secondary)', fontSize: 11.5, fontVariantNumeric: 'tabular-nums', flex: 1, minWidth: 0 }}
+                        title={it.request_id}
+                      >
+                        {it.request_id || '—'}
+                      </span>
+                      {it.request_id && <CopyBtn text={it.request_id} label="链路 ID" />}
                     </span>
                   </td>
                   <td style={{ padding: '9px 8px', whiteSpace: 'nowrap' }}>

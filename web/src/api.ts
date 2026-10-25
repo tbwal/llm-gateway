@@ -255,6 +255,9 @@ export interface LogsQuery {
   model?: string
   channel_id?: number
   provider?: string
+  request_id?: string // 链路 ID 精确筛选（排障：输入 req_xxx 拉出该请求全部记录）
+  access_key_name?: string // 调用方名称精确筛选
+  client_ip?: string // 客户端 IP 精确筛选
   days?: number
 }
 
@@ -265,6 +268,9 @@ export async function fetchUsageLogs(q: LogsQuery = {}): Promise<UsageLogsResp> 
   if (q.model) params.set('model', q.model)
   if (q.channel_id) params.set('channel_id', String(q.channel_id))
   if (q.provider) params.set('provider', q.provider)
+  if (q.request_id) params.set('request_id', q.request_id)
+  if (q.access_key_name) params.set('access_key_name', q.access_key_name)
+  if (q.client_ip) params.set('client_ip', q.client_ip)
   if (q.days) params.set('days', String(q.days))
   const qs = params.toString()
   // ⚠️ 与 usage 看板其他接口一致：返回体无 code/data 包装（{total,page,page_size,items}）

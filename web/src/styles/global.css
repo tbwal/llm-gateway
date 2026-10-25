@@ -594,6 +594,16 @@ select.glass-input option {
   color: #f4f4f8;
 }
 
+/* ------- 链路 ID 复制按钮：hover 单元格时显示 ------- */
+.req-copy-cell button.req-copy-btn {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.req-copy-cell:hover button.req-copy-btn,
+.req-copy-cell button.req-copy-btn.req-copied {
+  opacity: 1;
+}
+
 /* ------- 自定义滚动条（黑紫玻璃风：细窄 + 半透明紫 + 圆角） ------- */
 *::-webkit-scrollbar {
   width: 7px;
