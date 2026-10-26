@@ -288,3 +288,48 @@ export function fmtCost(v: number): string {
 export function fmtNum(v: number): string {
   return new Intl.NumberFormat('zh-CN').format(Math.round(v))
 }
+
+/* ================= 日志文件（请求日志页"日志文件"区） ================= */
+
+export interface LogFileMeta {
+  date: string // 日期目录名；全局日志为 "global"
+  name: string // requestID.log / global.log
+  rel_path: string // 下载参数：请求日志为 "2026-10-25/req_xxx.log"，全局日志固定 "global"
+  size: number // 字节
+  mod_time: string // 修改时间（展示用）
+}
+
+export interface LogFilesResp {
+  global: LogFileMeta | null
+  files: LogFileMeta[] // 请求日志文件，日期倒序
+  dir: string // 服务端日志根目录（展示用）
+}
+
+export async function fetchLogFiles(): Promise<LogFilesResp> {
+  return getJSON<LogFilesResp>('/api/logs/files')
+}
+
+/** 下载日志文件：后端以附件返回 → blob → 浏览器触发保存 */
+export async function downloadLogFile(relPath: string, fileName: string): Promise<void> {
+  const resp = await fetch(`/api/logs/files/download?file=${encodeURIComponent(relPath)}`)
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => null)
+    throw new Error(body?.message || `下载失败（HTTP ${resp.status}）`)
+  }
+  const blob = await resp.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = fileName
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+/** 日志文件大小格式化：B → KB → MB */
+export function fmtFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`
+}

@@ -7,7 +7,6 @@ import (
 	"encoding/json" // JSON：解析/重组 SSE 事件
 	"errors"       // 错误判断：识别 io.EOF 结束流
 	"io"           // 流操作：读取请求体、复制响应体
-	"log"          // 日志：记录转发链路
 	"math/rand/v2" // 随机数：加权随机选渠道（rand.IntN 是 Go 1.22+ 推荐写法）
 	"net"          // 连接层：Dialer 超时（连接/KeepAlive 分层超时）
 	"net/http"
@@ -172,10 +171,10 @@ func (h *RelayHandler) recordUsage(c *gin.Context, ch model.Channel, modelName s
 		FirstResponseMs:  firstRespMs,
 	}
 	if err := h.db.Create(&logEntry).Error; err != nil {
-		log.Printf("[usage] 计费落库失败: %v", err)
+		RequestLogf(c, "[usage] 计费落库失败: %v", err)
 		return
 	}
-	log.Printf("[usage] req=%s 渠道 id=%d model=%s tokens=%d+%d cost=%.4f元", reqID, ch.ID, modelName, promptTokens, completionTokens, cost)
+	RequestLogf(c, "[usage] req=%s 渠道 id=%d model=%s tokens=%d+%d cost=%.4f元", reqID, ch.ID, modelName, promptTokens, completionTokens, cost)
 }
 
 // logUsageFailure 包级失败落库（relay 转发链路与 AccessKeyAuth 中间件共用）
@@ -197,10 +196,10 @@ func logUsageFailure(db *gorm.DB, c *gin.Context, ch model.Channel, modelName st
 		FirstResponseMs:  firstRespMs, // 失败分支未 mark → 0（语义：没等到任何响应）
 	}
 	if err := db.Create(&logEntry).Error; err != nil {
-		log.Printf("[usage] 失败落库失败: %v", err)
+		RequestLogf(c, "[usage] 失败落库失败: %v", err)
 		return
 	}
-	log.Printf("[usage] 失败 req=%s 渠道 id=%d model=%s status=%d err=%s", reqID, ch.ID, modelName, status, errMsg)
+	RequestLogf(c, "[usage] 失败 req=%s 渠道 id=%d model=%s status=%d err=%s", reqID, ch.ID, modelName, status, errMsg)
 }
 
 // recordUsageFailure 失败也落库：把被拒绝/失败/异常的请求写成审计流水
@@ -715,7 +714,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		if err != nil {
 			// fail-open：限流器自身故障（如 Redis 连不上）时放行，
 			// 保证"限流组件挂了"不会拖垮整个网关（可用性优先），但记日志可观测
-			log.Printf("[ratelimit] 限流器故障，fail-open 放行（key=%s）: %v", key, err)
+			RequestLogf(c, "[ratelimit] 限流器故障，fail-open 放行（key=%s）: %v", key, err)
 		} else if !ok {
 			// 失败也落库：限流拒绝在解析 body 之前，渠道/模型拿不到 → 传空值
 			h.recordUsageFailure(c, model.Channel{}, "", http.StatusTooManyRequests, "滑动窗口内请求超限，限流拒绝")
@@ -777,7 +776,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			}
 			return
 		}
-		log.Printf("[relay] 尝试渠道 id=%d name=%s weight=%d → %s", ch.ID, ch.Name, ch.Weight, ch.BaseURL)
+		RequestLogf(c, "[relay] 尝试渠道 id=%d name=%s weight=%d → %s", ch.ID, ch.Name, ch.Weight, ch.BaseURL)
 
 		// 构造发给上游的请求
 		// 上游地址 = 渠道 base_url + 协议路径：
@@ -798,7 +797,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		// 绝不把密文当密钥发给上游（那会 401，还暴露内部格式）。
 		apiKey, err := h.enc.DecryptOrRaw(ch.APIKey)
 		if err != nil {
-			log.Printf("[relay] 渠道 id=%d 密钥解密失败: %v，尝试下一个", ch.ID, err)
+			RequestLogf(c, "[relay] 渠道 id=%d 密钥解密失败: %v，尝试下一个", ch.ID, err)
 			tried[ch.ID] = struct{}{}
 			h.breakers.recordFailure(ch.ID, time.Now()) // 密钥坏了也算渠道故障，累计熔断
 			continue
@@ -810,7 +809,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		if anthropic {
 			upBody, err = convertToAnthropic(body)
 			if err != nil {
-				log.Printf("[relay] 渠道 id=%d 请求转换失败: %v，尝试下一个", ch.ID, err)
+				RequestLogf(c, "[relay] 渠道 id=%d 请求转换失败: %v，尝试下一个", ch.ID, err)
 				tried[ch.ID] = struct{}{}
 				continue
 			}
@@ -837,7 +836,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		upResp, err := h.client.Do(req)
 		if err != nil {
 			// 网络层失败（连不上/超时）→ 记入已试 + 熔断计数，换下一个渠道
-			log.Printf("[relay] 渠道 id=%d 网络失败: %v，尝试下一个", ch.ID, err)
+			RequestLogf(c, "[relay] 渠道 id=%d 网络失败: %v，尝试下一个", ch.ID, err)
 			tried[ch.ID] = struct{}{}
 			h.breakers.recordFailure(ch.ID, time.Now())
 			continue
@@ -846,7 +845,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		// 上游给了明确响应，按状态码分流：
 		if upResp.StatusCode >= 500 {
 			// 5xx = 上游服务器故障 → 值得换渠道重试；同时累计熔断计数
-			log.Printf("[relay] 渠道 id=%d 返回 %d，尝试下一个", ch.ID, upResp.StatusCode)
+			RequestLogf(c, "[relay] 渠道 id=%d 返回 %d，尝试下一个", ch.ID, upResp.StatusCode)
 			upResp.Body.Close() // 显式关闭，释放连接（不用 defer——循环里会累积）
 			tried[ch.ID] = struct{}{}
 			h.breakers.recordFailure(ch.ID, time.Now())
@@ -859,7 +858,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		//   ⚠️ 从此处起渠道已锁定：响应开始流向客户端，故障转移到此为止
 		defer upResp.Body.Close()
 		h.breakers.recordSuccess(ch.ID) // 拿到响应 = 渠道是通的，记成功清失败计数
-		log.Printf("[relay] 渠道 id=%d 返回 %d，锁定并透传", ch.ID, upResp.StatusCode)
+		RequestLogf(c, "[relay] 渠道 id=%d 返回 %d，锁定并透传", ch.ID, upResp.StatusCode)
 
 		// 把上游的响应搬回给客户端，按类型分流：
 		//   - SSE（text/event-stream）→ 增量转换：逐事件解析→重组→Flush
@@ -873,12 +872,12 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		c.Status(upResp.StatusCode)                                 // 再写状态码（头随之发出）
 
 		if strings.Contains(upResp.Header.Get("Content-Type"), "text/event-stream") {
-			log.Printf("[relay] 渠道 id=%d SSE 流式响应，进入增量转换", ch.ID)
+			RequestLogf(c, "[relay] 渠道 id=%d SSE 流式响应，进入增量转换", ch.ID)
 			content, usageInfo, ferr := forwardSSE(c, upResp, isAnthropicProvider(ch.Provider))
 			if ferr != nil {
 				// 客户端断连 / 上游异常中断：记录但不再切换渠道（响应已锁定）
 				// 失败也落库：中断时 usage 往往拿不全，以可审计优先记失败
-				log.Printf("[relay] 渠道 id=%d SSE 转发中断: %v", ch.ID, ferr)
+				RequestLogf(c, "[relay] 渠道 id=%d SSE 转发中断: %v", ch.ID, ferr)
 				h.recordUsageFailure(c, ch, reqMeta.Model, upResp.StatusCode, "SSE 转发中断: "+ferr.Error())
 			} else {
 				// W3-② 计费：优先用上游返回的 usage；缺失时估算兜底
@@ -901,11 +900,11 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			// 非流式 + Anthropic 渠道：响应是 Anthropic 格式（content 数组 + stop_reason），
 			// 客户端（OpenAI SDK）不认——必须转成 OpenAI 格式再写回
 			markFirstResponse(c) // 首响应 = 上游响应已到达（Do 返回，含上游生成时间）
-			log.Printf("[relay] 渠道 id=%d 非流式响应，Anthropic → OpenAI 转换", ch.ID)
+			RequestLogf(c, "[relay] 渠道 id=%d 非流式响应，Anthropic → OpenAI 转换", ch.ID)
 			usageInfo, respText, cerr := convertAnthropicOnce(c, upResp)
 			if cerr != nil {
 				// 失败也落库：上游错误体不是合法 Anthropic JSON（如 4xx 错误页）→ 转换必然失败
-				log.Printf("[relay] 渠道 id=%d 非流式转换失败: %v", ch.ID, cerr)
+				RequestLogf(c, "[relay] 渠道 id=%d 非流式转换失败: %v", ch.ID, cerr)
 				h.recordUsageFailure(c, ch, reqMeta.Model, upResp.StatusCode, "Anthropic 响应转换失败: "+cerr.Error())
 			} else {
 				// W3-② 计费：Anthropic usage 里 input/output tokens → prompt/completion
@@ -924,11 +923,11 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			markFirstResponse(c) // 首响应 = 上游响应已到达（Do 返回，含上游生成时间）
 			respBody, rerr := io.ReadAll(upResp.Body)
 			if rerr != nil {
-				log.Printf("[relay] 渠道 id=%d 读取响应体失败: %v", ch.ID, rerr)
+				RequestLogf(c, "[relay] 渠道 id=%d 读取响应体失败: %v", ch.ID, rerr)
 				h.recordUsageFailure(c, ch, reqMeta.Model, upResp.StatusCode, "读取响应体失败: "+rerr.Error())
 			} else {
 				if _, werr := c.Writer.Write(respBody); werr != nil {
-					log.Printf("[relay] 渠道 id=%d 写回响应失败: %v", ch.ID, werr)
+					RequestLogf(c, "[relay] 渠道 id=%d 写回响应失败: %v", ch.ID, werr)
 				} else {
 					flushWriter(c) // 收尾 Flush，确保最后一截也立即送达
 				}

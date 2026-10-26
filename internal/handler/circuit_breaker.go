@@ -18,6 +18,7 @@ package handler
 // ============================================================
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -40,6 +41,7 @@ const (
 // channelBreaker 单个渠道的熔断状态
 // 并发安全：多个 goroutine 同时转发，状态读写必须加锁
 type channelBreaker struct {
+	id       uint         // 渠道 ID（日志/排障用）
 	mu       sync.Mutex
 	state    breakerState
 	failures int       // CLOSED 下连续失败次数（成功清零）
@@ -48,6 +50,7 @@ type channelBreaker struct {
 }
 
 // allow 调度前的熔断决策：这个渠道现在能不能被选中？
+// 返回 true 的调用方会立刻锁定该渠道——若是"冷却后放行"，这次就是探测请求
 func (b *channelBreaker) allow(now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -58,6 +61,7 @@ func (b *channelBreaker) allow(now time.Time) bool {
 		if now.Sub(b.openedAt) >= breakerCooldown {
 			b.state = stateHalfOpen
 			b.probed = true
+			log.Printf("[breaker] 渠道 id=%d 冷却期满 → HALF_OPEN，放行探测请求", b.id)
 			return true
 		}
 		return false // 冷却中：调度跳过该渠道
@@ -80,6 +84,7 @@ func (b *channelBreaker) recordSuccess() {
 	b.failures = 0
 	if b.state == stateHalfOpen {
 		b.state = stateClosed
+		log.Printf("[breaker] 渠道 id=%d 半开探测成功 → CLOSED（恢复调度）", b.id)
 	}
 }
 
@@ -93,6 +98,7 @@ func (b *channelBreaker) recordFailure(now time.Time) {
 	if b.state == stateHalfOpen || b.failures >= maxBreakerFailures {
 		b.state = stateOpen
 		b.openedAt = now
+		log.Printf("[breaker] 渠道 id=%d 连续失败 %d 次 → OPEN（熔断摘除，冷却 %ds）", b.id, b.failures, int(breakerCooldown.Seconds()))
 	}
 }
 
@@ -103,6 +109,7 @@ func (b *channelBreaker) probeOK() {
 	b.state = stateClosed
 	b.failures = 0
 	b.probed = false
+	log.Printf("[breaker] 渠道 id=%d 健康探测成功 → CLOSED（主动恢复调度）", b.id)
 }
 
 // circuitBreakers 全渠道熔断器注册表（按渠道 ID 索引，懒创建）
@@ -122,7 +129,7 @@ func (cb *circuitBreakers) get(id uint) *channelBreaker {
 	defer cb.mu.Unlock()
 	b, ok := cb.items[id]
 	if !ok {
-		b = &channelBreaker{state: stateClosed}
+		b = &channelBreaker{id: id, state: stateClosed}
 		cb.items[id] = b
 	}
 	return b

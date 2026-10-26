@@ -216,6 +216,7 @@ curl http://localhost:8080/v1/chat/completions \
 | `RATE_LIMIT_PER_MIN` | `60` | 每调用方每分钟最大请求数（滑动窗口）。**仅启动默认**——在管理台保存过限流次数后，settings 表的值覆盖它（重启保留） |
 | `RATE_LIMIT_STORE` | `memory` | `memory`（本地单机）/ `redis`（多实例共享） |
 | `REDIS_ADDR` | `localhost:6379` | `store=redis` 时的 Redis 地址 |
+| `REQUEST_LOG_DIR` | `data/request-logs` | 请求级日志根目录（每条请求一个文件：`{dir}/{date}/{requestID}.log`） |
 
 示例：`$env:LLM_GATEWAY_SECRET_KEY = "<64 位 hex>"; $env:RATE_LIMIT_PER_MIN = 3; go run ./cmd/server`
 
@@ -699,6 +700,20 @@ PEXPIRE key window+1000             -- 防 key 永不删除
 | GET | `/api/system/ratelimit` | 当前限流配置（enabled / store / limit_per_min / persisted / redis_addr） |
 | PUT | `/api/system/ratelimit` | `{"per_min": N}` 运行时改上限 + 落库（参数错误返回真 HTTP 400） |
 
+### 第 15.1 节 日志文件下载（管理台"请求日志"页）
+
+请求级日志落盘后，管理后台可直接下载文件（请求日志按条、全局日志按天）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/logs/files` | 文件列表：`global`（全局日志，存在才返回）+ `files[]`（请求日志，按日期倒序，含 `rel_path`/`size`/`mod_time`） |
+| GET | `/api/logs/files/download?file=` | 下载附件。`file=global` 或 `file=2026-10-25/req_xxx.log` |
+
+**安全边界**（下载接口核心，面试讲点）：前端只传**相对路径**，服务端三重校验——
+① 后缀必须是 `.log`；② 显式拒绝 `/` `\` 开头（Windows 的 `filepath.IsAbs` 只认盘符，`/x` 不算绝对路径的坑）；③ Clean 后必须恰好是两层 `{date}/{requestID}.log` 且 `filepath.Rel` 仍在根目录内——`../`、深层、裸文件名、绝对路径一律 400。测试：`logfile_test.go` 覆盖穿越/越层/后缀三组用例。
+
+全局日志 `data/logs/global.log` 由 `cmd/server/main.go` 启动时 `log.SetOutput(io.MultiWriter(os.Stdout, f))` tee 落盘（失败静默，不阻塞启动）。
+
 **持久化优先级**（三层，面试讲点）：
 
 ```
@@ -887,6 +902,8 @@ llm-gateway/
 │   │   ├── circuit_breaker.go# 熔断三态状态机
 │   │   ├── health_probe.go   # 后台健康探测（主动恢复）
 │   │   ├── access_key.go     # AccessKey 签发/CRUD + Bearer 鉴权中间件（可信身份）
+│   │   ├── request_log.go    # 请求级日志落盘（一条 requestID 一个文件 + RequestLogf 统一入口）
+│   │   ├── logfile.go        # 日志文件列表/下载（安全校验防路径穿越）
 │   │   ├── system_status.go  # 系统状态快照（注入 limiter，实时生效值）
 │   │   ├── ratelimit_admin.go# 限流配置 GET/PUT + settings 持久化
 │   │   └── usage_dashboard.go# 用量看板 + 请求日志 API（查询时聚合）
@@ -947,6 +964,8 @@ go test ./... -count=1    # 全量单测
 | Key 为什么哈希存 | 拖库也拿不到可用 Key；明文只在签发瞬间返回一次；前缀 sk_lgw_ 便于识别 |
 | 运行时配置怎么改 | Limiter 接口 SetLimit/Limit（memory 锁 / redis atomic）；settings KV 持久化，重启恢复，立即生效 |
 | 失败请求要不要记账 | 要——流水 + 审计一张表：status/error 落库，429/401/502/SSE 中断全留痕 |
+| 请求日志怎么落盘 | 一条 requestID 一个文件（`data/request-logs/{date}/{requestID}.log`）：`AccessKeyAuth` 入口创建，`RequestLogf(c,...)` 写请求链路打印，无上下文自动 fallback 全局 log；requestID 白名单校验防路径穿越 |
+| 日志文件怎么下载 | 管理台"请求日志"页 `/api/logs/files`（列表）+ `/download?file=`（附件）；相对路径三重校验（.log 后缀 / 拒 / 与 \ 开头 / 两层结构 + Rel 在根内）防路径穿越；全局日志由 main.go tee 落盘 `data/logs/global.log` |
 | 请求审计怎么做 | request_id 链路 ID（401 也有）+ 调用方（access_key_name）+ IP + duration_ms/首响应（TTFT）；mark 时算差值，本地 <1ms 显示 <1ms |
 | 慢请求怎么定位 | duration_ms（总耗时）vs first_response_ms（TTFT）：首高 = 上游开口慢；首正常总长 = 生成/传输慢 |
 | 计费为什么流水表 | 只 INSERT 无锁竞争，聚合放读侧；usage 缺失用估算兜底，口径统一 |

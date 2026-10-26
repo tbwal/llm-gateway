@@ -121,5 +121,15 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 		rlg.PUT("", rl.Update)
 	}
 
+	// 日志文件下载（管理台"请求日志"页）：请求级日志 + 全局日志
+	//   GET /api/logs/files               → 文件列表（全局日志 + 按日期分组的请求日志）
+	//   GET /api/logs/files/download?file=→ 下载（file="global" 或 "2026-10-25/req_xxx.log"）
+	lf := handler.NewLogFileHandler()
+	lgf := r.Group("/api/logs")
+	{
+		lgf.GET("/files", lf.List)
+		lgf.GET("/files/download", lf.Download)
+	}
+
 	return r
 }

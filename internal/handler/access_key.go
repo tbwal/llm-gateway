@@ -255,6 +255,12 @@ func AccessKeyAuth(db *gorm.DB) gin.HandlerFunc {
 		// 链路 ID 在最前面生成（哪怕 401 也有 ID，失败日志可关联排障）
 		c.Set(requestIDKey, newRequestID())
 
+		// 请求日志文件：一条 requestID 一个文件（{date}/{requestID}.log），
+		// 整个链路（含 401/403、转发轨迹）都可审计；c.Next() 返回后关闭
+		rl := newRequestLogger(RequestIDFromCtx(c))
+		c.Set(requestLogKey, rl)
+		defer func() { rl.Close() }()
+
 		// ① 解析请求 model：决定该模型是否受凭证保护
 		modelName := parseRequestModel(c)
 		auth := c.GetHeader("Authorization")

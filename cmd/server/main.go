@@ -2,7 +2,10 @@
 package main
 
 import (
+	"io"
 	"log"
+	"os"
+	"path/filepath"
 
 	"llm-gateway/config"
 	"llm-gateway/internal/crypto"
@@ -12,6 +15,14 @@ import (
 
 // main 是唯一入口，运行 `go run ./cmd/server` 时从这里开始
 func main() {
+	// ⓪ 全局日志同时落盘（管理台"请求日志"页可下载）：data/logs/global.log
+	// tee 到 stdout（终端可见）+ 文件（可下载、可回溯）；失败静默——日志落盘不阻塞启动
+	if f, err := os.OpenFile(filepath.Join("data", "logs", "global.log"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		defer f.Close()
+		log.SetOutput(io.MultiWriter(os.Stdout, f))
+	}
+
 	// ① 加载配置（端口 + 数据库路径 + 加密密钥）
 	cfg := config.Load()
 

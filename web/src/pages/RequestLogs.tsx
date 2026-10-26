@@ -1,6 +1,58 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { fetchChannels, fetchUsageLogs, type UsageLogItem } from '../api'
+import {
+  fetchChannels,
+  fetchLogFiles,
+  fetchUsageLogs,
+  downloadLogFile,
+  fmtFileSize,
+  type LogFileMeta,
+  type UsageLogItem,
+} from '../api'
 import { Icon } from '../components/Icon'
+
+/** 下载按钮：点击触发浏览器保存；下载中显示 loading 态，失败红字提示 */
+function DownloadBtn({ relPath, fileName }: { relPath: string; fileName: string }) {
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const run = async () => {
+    setBusy(true)
+    setErr('')
+    try {
+      await downloadLogFile(relPath, fileName)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '下载失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <button
+        onClick={run}
+        disabled={busy}
+        title={`下载 ${fileName}`}
+        aria-label={`下载 ${fileName}`}
+        className="req-copy-btn"
+        style={{
+          border: '1px solid var(--border)',
+          background: 'rgba(139,92,246,0.06)',
+          padding: '3px 8px',
+          cursor: busy ? 'default' : 'pointer',
+          color: 'var(--accent-soft)',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 4,
+          fontSize: 11.5,
+          borderRadius: 6,
+        }}
+      >
+        <Icon name="download" size={12} />
+        {busy ? '下载中…' : '下载'}
+      </button>
+      {err && <span style={{ color: 'var(--danger)', fontSize: 11 }}>{err}</span>}
+    </span>
+  )
+}
 
 /**
  * 请求日志页：usage_logs 流水明细（分页 + 筛选）
@@ -61,6 +113,13 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
 
+  // 日志文件区（请求级日志 + 全局日志）
+  const [globalFile, setGlobalFile] = useState<LogFileMeta | null>(null)
+  const [logFiles, setLogFiles] = useState<LogFileMeta[]>([])
+  const [logDir, setLogDir] = useState('')
+  const [logLoading, setLogLoading] = useState(true)
+  const [logErr, setLogErr] = useState('')
+
   // 筛选条件
   const [fModel, setFModel] = useState('')
   const [fChannel, setFChannel] = useState('')
@@ -104,6 +163,33 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
       .then((cs) => setChannels(cs.map((c) => ({ id: c.id, name: c.name }))))
       .catch(() => {})
   }, [])
+
+  // 日志文件列表（请求级日志 + 全局日志）
+  useEffect(() => {
+    fetchLogFiles()
+      .then((d) => {
+        setGlobalFile(d.global)
+        setLogFiles(d.files)
+        setLogDir(d.dir)
+        setLogErr('')
+      })
+      .catch((e) => setLogErr(e instanceof Error ? e.message : '加载日志文件列表失败'))
+      .finally(() => setLogLoading(false))
+  }, [refreshTick])
+
+  // 请求日志文件按日期分组（服务端已按日期+文件名倒序）
+  const byDate = useMemo(() => {
+    const groups: { date: string; files: LogFileMeta[] }[] = []
+    for (const f of logFiles) {
+      let g = groups[groups.length - 1]
+      if (!g || g.date !== f.date) {
+        g = { date: f.date, files: [] }
+        groups.push(g)
+      }
+      g.files.push(f)
+    }
+    return groups
+  }, [logFiles])
 
   const totalPages = useMemo(() => Math.max(1, Math.ceil(total / pageSize)), [total, pageSize])
 
@@ -255,6 +341,83 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
       </div>
 
       {err && <span style={{ color: 'var(--danger)', fontSize: '13px' }}>{err}</span>}
+
+      {/* ===== 日志文件：请求级日志（一条 requestID 一个文件）+ 全局日志 ===== */}
+      <div className="glass card-pad" style={{ marginBottom: 14 }}>
+        <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+          <div>
+            <span style={{ fontWeight: 600, fontSize: 13.5 }}>日志文件</span>
+            <span className="muted" style={{ marginLeft: 10, fontSize: 12 }}>
+              {logDir || '…'}
+            </span>
+          </div>
+          {logErr && <span style={{ color: 'var(--danger)', fontSize: 12 }}>{logErr}</span>}
+        </div>
+
+        {logLoading ? (
+          <div style={{ opacity: 0.7, padding: '10px 0', fontSize: 13 }}>加载文件列表…</div>
+        ) : (
+          <div style={{ marginTop: 10 }}>
+            {/* 全局日志（main.go tee 落盘；存在才显示） */}
+            {globalFile && (
+              <div
+                className="row"
+                style={{ justifyContent: 'space-between', alignItems: 'center', gap: 10, padding: '7px 10px', borderRadius: 8, background: 'rgba(139,92,246,0.05)', border: '1px solid var(--border)' }}
+              >
+                <div className="row" style={{ alignItems: 'center', gap: 8, minWidth: 0 }}>
+                  <Icon name="server" size={13} style={{ color: 'var(--accent-soft)', flexShrink: 0 }} />
+                  <span style={{ fontSize: 12.5, fontWeight: 600 }}>全局日志</span>
+                  <span className="badge" style={{ fontSize: 10.5, color: 'var(--text-muted)' }}>{globalFile.name}</span>
+                </div>
+                <div className="row" style={{ alignItems: 'center', gap: 10 }}>
+                  <span className="muted" style={{ fontSize: 11.5, fontVariantNumeric: 'tabular-nums' }}>
+                    {fmtFileSize(globalFile.size)} · {globalFile.mod_time}
+                  </span>
+                  <DownloadBtn relPath={globalFile.rel_path} fileName={globalFile.name} />
+                </div>
+              </div>
+            )}
+
+            {/* 请求级日志：按日期分组，紧凑列表（超高滚动） */}
+            {byDate.length === 0 ? (
+              <div style={{ opacity: 0.7, padding: '10px 0', fontSize: 13 }}>还没有请求日志文件——发几个请求后这里会出现 data/request-logs/日期/req_xxx.log。</div>
+            ) : (
+              <div style={{ marginTop: 8, maxHeight: 240, overflowY: 'auto' }}>
+                {byDate.map((g) => (
+                  <div key={g.date} style={{ marginBottom: 6 }}>
+                    <div className="muted" style={{ fontSize: 11, letterSpacing: '0.05em', padding: '4px 4px 2px' }}>
+                      {g.date} · {g.files.length} 个文件
+                    </div>
+                    {g.files.map((f) => (
+                      <div
+                        key={f.rel_path}
+                        className="row"
+                        style={{ justifyContent: 'space-between', alignItems: 'center', gap: 10, padding: '4px 8px', borderRadius: 6 }}
+                      >
+                        <div className="row" style={{ alignItems: 'center', gap: 8, minWidth: 0 }}>
+                          <Icon name="list" size={12} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+                          <span
+                            style={{ fontSize: 11.5, fontVariantNumeric: 'tabular-nums', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}
+                            title={f.name}
+                          >
+                            {f.name.replace(/\.log$/, '')}
+                          </span>
+                        </div>
+                        <div className="row" style={{ alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                          <span className="muted" style={{ fontSize: 11, fontVariantNumeric: 'tabular-nums' }}>
+                            {fmtFileSize(f.size)} · {f.mod_time.slice(11)}
+                          </span>
+                          <DownloadBtn relPath={f.rel_path} fileName={f.name} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* ===== 日志表格 ===== */}
       <div className="glass card-pad" style={{ overflowX: 'auto' }}>
