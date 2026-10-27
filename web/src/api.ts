@@ -166,6 +166,17 @@ export interface SystemStatus {
   cache: { enabled_channels: number; total_channels: number; last_refresh: string }
   access_keys: number
   breakers: BreakerState[]
+  usage_writer?: {
+    enabled: boolean
+    backend?: 'memory' | 'redis_stream' | 'unknown'
+    stream?: string
+    group?: string
+    enqueued?: number
+    persisted?: number
+    dropped?: number
+    write_failed?: number
+    queue_depth?: number
+  }
 }
 
 interface SystemStatusResp {

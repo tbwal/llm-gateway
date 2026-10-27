@@ -183,11 +183,17 @@ export default function SystemStatusPage({ refreshTick }: { refreshTick: number 
 
             <div className="glass sys-card">
               <div className="sys-head">
-                <Icon name="database" size={13} /> 渠道缓存
+                <Icon name="database" size={13} /> 渠道与密钥
               </div>
-              <div className="sys-main">
-                {st.cache.enabled_channels}
-                <span className="unit">/ {st.cache.total_channels} 启用</span>
+              <div className="sys-main" style={{ gap: 20 }}>
+                <span>
+                  {st.cache.enabled_channels}
+                  <span className="unit">/ {st.cache.total_channels} 渠道</span>
+                </span>
+                <span>
+                  {st.access_keys}
+                  <span className="unit">个密钥</span>
+                </span>
               </div>
               <div className="sys-sub">
                 <Icon name="clock" size={11} style={{ verticalAlign: -1, marginRight: 3 }} />
@@ -197,10 +203,49 @@ export default function SystemStatusPage({ refreshTick }: { refreshTick: number 
 
             <div className="glass sys-card">
               <div className="sys-head">
-                <Icon name="key" size={13} /> AccessKey
+                <Icon name="gauge" size={13} /> 异步落库
               </div>
-              <div className="sys-main">{st.access_keys}</div>
-              <div className="sys-sub">已签发调用方凭证</div>
+              {st.usage_writer?.enabled ? (
+                <>
+                  <div className="sys-main">
+                    <span
+                      className="badge"
+                      style={{
+                        alignSelf: 'center',
+                        color: st.usage_writer.backend === 'redis_stream' ? '#fbbf24' : 'var(--accent)',
+                        border: `1px solid ${st.usage_writer.backend === 'redis_stream' ? 'rgba(251,191,36,0.35)' : 'rgba(139,92,246,0.35)'}`,
+                        background: st.usage_writer.backend === 'redis_stream' ? 'rgba(251,191,36,0.08)' : 'rgba(139,92,246,0.08)',
+                      }}
+                    >
+                      {st.usage_writer.backend === 'redis_stream' ? 'Redis Stream' : '内存队列'}
+                    </span>
+                  </div>
+                  <div className="sys-sub" style={{ lineHeight: 1.8 }}>
+                    入队 {st.usage_writer.enqueued ?? 0} · 已落库 {st.usage_writer.persisted ?? 0}
+                    <br />
+                    {st.usage_writer.dropped ? (
+                      <span style={{ color: '#fbbf24' }}>丢弃 {st.usage_writer.dropped}</span>
+                    ) : (
+                      <span style={{ color: 'var(--text-muted)' }}>丢弃 0</span>
+                    )}
+                    {st.usage_writer.write_failed ? (
+                      <span style={{ color: 'var(--danger)' }}> · 写失败 {st.usage_writer.write_failed}</span>
+                    ) : (
+                      <span style={{ color: 'var(--text-muted)' }}> · 写失败 0</span>
+                    )}
+                    {st.usage_writer.queue_depth !== undefined && (
+                      <span style={{ color: 'var(--text-muted)' }}> · 队列 {st.usage_writer.queue_depth}</span>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="sys-main" style={{ fontSize: 14, color: 'var(--text-muted)' }}>
+                    未启用
+                  </div>
+                  <div className="sys-sub">同步落库模式</div>
+                </>
+              )}
             </div>
           </div>
 

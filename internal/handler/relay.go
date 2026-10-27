@@ -35,10 +35,12 @@ type RelayHandler struct {
 	enc    crypto.Service // 加密服务：渠道 API Key 从库里取出来是密文，转发前先解密
 	breakers *circuitBreakers // 熔断器注册表：跨请求统计渠道连续失败，自动摘除/恢复
 	limiter  ratelimit.Limiter // W3 限流器：滑动窗口（memory 本地 / redis 分布式）
+	usageWriter UsageWriter // 异步用量日志落库（主链路不被写库阻塞；接口类型，可换内存/Redis 实现）
 }
 
-// NewRelayHandler 构造器：注入 db、加密服务、渠道缓存、限流器；创建连接池调优的转发客户端和熔断器
-func NewRelayHandler(db *gorm.DB, enc crypto.Service, cache *channelCache, limiter ratelimit.Limiter) *RelayHandler {
+// NewRelayHandler 构造器：注入 db、加密服务、渠道缓存、限流器、异步落库器
+// usageWriter 传 nil 时内部默认创建内存版（兼容测试）
+func NewRelayHandler(db *gorm.DB, enc crypto.Service, cache *channelCache, limiter ratelimit.Limiter, usageWriter UsageWriter) *RelayHandler {
 	// 连接池调优（W2 连接池/热更新：连接侧）
 	// 默认 http.DefaultTransport 的 MaxIdleConnsPerHost=2——
 	// 高并发转发时并发连接无法复用，每请求重建 TCP 连接（慢 + 耗资源）。
@@ -58,6 +60,11 @@ func NewRelayHandler(db *gorm.DB, enc crypto.Service, cache *channelCache, limit
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
+	// usageWriter 传 nil 时兜底创建内存版（兼容测试）
+	if usageWriter == nil {
+		usageWriter = NewUsageWriter(db)
+	}
+	globalUsageWriter = usageWriter
 	return &RelayHandler{
 		db:   db,
 		cache: cache,
@@ -68,7 +75,13 @@ func NewRelayHandler(db *gorm.DB, enc crypto.Service, cache *channelCache, limit
 		enc:      enc,
 		breakers: newCircuitBreakers(),
 		limiter:  limiter,
+		usageWriter: usageWriter,
 	}
+}
+
+// UsageWriter 暴露异步落库器（main 退出时调用 Close 优雅 drain）
+func (h *RelayHandler) UsageWriter() UsageWriter {
+	return h.usageWriter
 }
 
 // Breakers 暴露熔断器注册表（供后台健康探测扫描 OPEN 渠道）
@@ -172,11 +185,26 @@ func (h *RelayHandler) recordUsage(c *gin.Context, ch model.Channel, modelName s
 		FirstResponseMs:  firstRespMs,
 		AttemptsJSON:     attemptsFromCtx(c), // 故障转移链：单次成功=1条；换过渠道=多条
 	}
-	if err := h.db.Create(&logEntry).Error; err != nil {
+	// 异步入队（测试置 nil 时 fallback 同步写）
+	if h.usageWriter != nil {
+		h.usageWriter.Enqueue(logEntry)
+	} else if err := h.db.Create(&logEntry).Error; err != nil {
 		RequestLogf(c, "[usage] 计费落库失败: %v", err)
 		return
 	}
-	RequestLogf(c, "[usage] req=%s 渠道 id=%d model=%s tokens=%d+%d cost=%.4f元", reqID, ch.ID, modelName, promptTokens, completionTokens, cost)
+	RequestLogf(c, "[usage] req=%s 渠道 id=%d model=%s tokens=%d+%d cost=%.4f元（异步落库）", reqID, ch.ID, modelName, promptTokens, completionTokens, cost)
+}
+
+// globalUsageWriter 包级异步落库器：由 NewRelayHandler 启动时赋值。
+// logUsageFailure 被 AccessKeyAuth 中间件（没有 RelayHandler 指针）直接调用，
+// 用包级引用是最小改动；nil 时 fallback 同步 Create（测试兼容）。
+var globalUsageWriter UsageWriter
+
+// CloseUsageWriter 优雅关闭异步落库器（main 退出时调用，drain 队列剩余日志）
+func CloseUsageWriter() {
+	if globalUsageWriter != nil {
+		globalUsageWriter.Close()
+	}
 }
 
 // logUsageFailure 包级失败落库（relay 转发链路与 AccessKeyAuth 中间件共用）
@@ -198,11 +226,14 @@ func logUsageFailure(db *gorm.DB, c *gin.Context, ch model.Channel, modelName st
 		FirstResponseMs:  firstRespMs, // 失败分支未 mark → 0（语义：没等到任何响应）
 		AttemptsJSON:     attemptsFromCtx(c),
 	}
-	if err := db.Create(&logEntry).Error; err != nil {
+	// 优先走异步队列；writer 未启动（测试）时 fallback 同步写
+	if globalUsageWriter != nil {
+		globalUsageWriter.Enqueue(logEntry)
+	} else if err := db.Create(&logEntry).Error; err != nil {
 		RequestLogf(c, "[usage] 失败落库失败: %v", err)
 		return
 	}
-	RequestLogf(c, "[usage] 失败 req=%s 渠道 id=%d model=%s status=%d err=%s", reqID, ch.ID, modelName, status, errMsg)
+	RequestLogf(c, "[usage] 失败 req=%s 渠道 id=%d model=%s status=%d err=%s（异步落库）", reqID, ch.ID, modelName, status, errMsg)
 }
 
 // recordUsageFailure 失败也落库：把被拒绝/失败/异常的请求写成审计流水

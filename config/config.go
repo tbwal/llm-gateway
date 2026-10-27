@@ -24,6 +24,13 @@ type Config struct {
 	RateLimitPerMin  int
 	RateLimitStore   string
 	RedisAddr        string
+
+	// ── 异步日志落库后端 ──
+	// UsageLogBackend 异步写 usage_logs 的队列后端：
+	//   memory（默认，单进程、重启丢队列里剩余消息）
+	//   redis（Redis Stream，多实例共享队列、重启不丢、ACK 确认）
+	// 与限流的 RateLimitStore 是独立决策：限流可以用 memory，日志可以用 redis
+	UsageLogBackend string
 }
 
 // Load 从环境变量读取配置，未设置时使用默认值
@@ -70,6 +77,12 @@ func Load() Config {
 		redisAddr = "localhost:6379"
 	}
 
+	// 异步日志后端：默认 memory；显式设 USAGE_LOG_BACKEND=redis 才切 Redis Stream
+	usageLogBackend := os.Getenv("USAGE_LOG_BACKEND")
+	if usageLogBackend == "" {
+		usageLogBackend = "memory"
+	}
+
 	return Config{
 		Port:              port,
 		DBPath:            dbPath,
@@ -78,5 +91,6 @@ func Load() Config {
 		RateLimitPerMin:   rateLimitPerMin,
 		RateLimitStore:    rateLimitStore,
 		RedisAddr:         redisAddr,
+		UsageLogBackend:   usageLogBackend,
 	}
 }

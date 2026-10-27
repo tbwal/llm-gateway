@@ -20,6 +20,7 @@ import (
 // 端到端验证：AccessKeyAuth 中间件 → 真实 RelayHandler → httptest mock 上游 → 落库
 func TestRelayAuditFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	globalUsageWriter = nil // 测试走同步落库，避免异步队列未刷盘导致查不到
 	db := newTestDB(t)
 	if err := db.AutoMigrate(&model.Channel{}, &model.UsageLog{}, &model.AccessKey{}); err != nil {
 		t.Fatalf("AutoMigrate error = %v", err)
@@ -65,7 +66,9 @@ func TestRelayAuditFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	relay := NewRelayHandler(db, enc, cache, nil)
+	relay := NewRelayHandler(db, enc, cache, nil, nil) // 最后一个 nil = 内部创建内存版
+	globalUsageWriter = nil // NewRelayHandler 启动了异步 writer，测试关掉走同步
+	relay.usageWriter = nil // recordUsage 走 h.usageWriter，也要置 nil 才 fallback 同步
 	r := gin.New()
 	r.POST("/v1/chat/completions", AccessKeyAuth(db), relay.ChatCompletions)
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 
 	"llm-gateway/config"
@@ -84,7 +85,26 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 			log.Printf("限流已开启: store=%s limit=%d/分钟", cfg.RateLimitStore, perMin)
 		}
 	}
-	relay := handler.NewRelayHandler(db, enc, cache, limiter)
+	// 异步落库器：根据 USAGE_LOG_BACKEND 选择内存版或 Redis Stream 版
+	//   - memory（默认）：单进程、重启丢队列剩余消息（本地开发用）
+	//   - redis：Redis Stream 队列、多实例共享、ACK 确认（生产用）
+	//   注意：与限流的 RateLimitStore 是独立配置，可分别选择
+	var usageWriter handler.UsageWriter
+	if cfg.UsageLogBackend == "redis" {
+		rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+		if rw, err := handler.NewRedisStreamUsageWriter(rdb, db); err != nil {
+			log.Printf("⚠️ Redis Stream 初始化失败，回退内存版: %v", err)
+			usageWriter = handler.NewUsageWriter(db)
+		} else {
+			usageWriter = rw
+			log.Printf("异步落库: Redis Stream（stream=%s group=%s）", handler.RedisStreamKey, handler.RedisStreamGroup)
+		}
+	} else {
+		usageWriter = handler.NewUsageWriter(db)
+		log.Printf("异步落库: 内存 channel 版（单进程模式）")
+	}
+
+	relay := handler.NewRelayHandler(db, enc, cache, limiter, usageWriter)
 	// AccessKey 鉴权中间件：校验 Bearer 凭证 → 注入可信身份（限流/计费维度）
 	// 没有合法凭证一律 401，停用的 key 即时 401（软吊销）
 	r.POST("/v1/chat/completions", handler.AccessKeyAuth(db), relay.ChatCompletions)
@@ -108,7 +128,7 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 
 	// 系统状态（管理台"系统状态"页）：聚合服务/限流/安全/缓存/熔断运行时快照
 	//   GET /api/system/status
-	sys := handler.NewSystemStatusHandler(db, cache, relay.Breakers(), cfg, limiter)
+	sys := handler.NewSystemStatusHandler(db, cache, relay.Breakers(), cfg, limiter, usageWriter)
 	r.GET("/api/system/status", sys.Status)
 
 	// 限流设置（管理台可改、重启保留）

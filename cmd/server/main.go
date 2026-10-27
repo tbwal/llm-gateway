@@ -9,6 +9,7 @@ import (
 
 	"llm-gateway/config"
 	"llm-gateway/internal/crypto"
+	"llm-gateway/internal/handler"
 	"llm-gateway/internal/router"
 	"llm-gateway/internal/storage"
 )
@@ -54,6 +55,8 @@ func main() {
 	r := router.New(db, enc, cfg)
 
 	// ⑤ 启动 HTTP 服务并监听端口（阻塞运行）
+	//    r.Run 返回（Ctrl+C）后 defer 执行：drain 异步日志队列剩余条目
+	defer handler.CloseUsageWriter()
 	log.Printf("AI 网关启动: http://localhost:%s", cfg.Port)
 	if err := r.Run(":" + cfg.Port); err != nil {
 		log.Fatal(err)

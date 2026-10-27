@@ -31,23 +31,25 @@ import (
 
 // SystemStatusHandler 系统状态接口处理器
 type SystemStatusHandler struct {
-	db        *gorm.DB
-	cache     *channelCache
-	breakers  *circuitBreakers
-	cfg       config.Config
-	limiter   ratelimit.Limiter // 可能为 nil：限流未开启
-	startedAt time.Time         // 进程启动时刻（uptime 基准）
+	db          *gorm.DB
+	cache       *channelCache
+	breakers    *circuitBreakers
+	cfg         config.Config
+	limiter     ratelimit.Limiter // 可能为 nil：限流未开启
+	usageWriter UsageWriter         // 异步落库器（可能为 nil：未启用）
+	startedAt   time.Time           // 进程启动时刻（uptime 基准）
 }
 
-// NewSystemStatusHandler 构造器：注入 db、缓存、熔断器、配置、限流器
-func NewSystemStatusHandler(db *gorm.DB, cache *channelCache, breakers *circuitBreakers, cfg config.Config, limiter ratelimit.Limiter) *SystemStatusHandler {
+// NewSystemStatusHandler 构造器：注入 db、缓存、熔断器、配置、限流器、异步落库器
+func NewSystemStatusHandler(db *gorm.DB, cache *channelCache, breakers *circuitBreakers, cfg config.Config, limiter ratelimit.Limiter, usageWriter UsageWriter) *SystemStatusHandler {
 	return &SystemStatusHandler{
-		db:        db,
-		cache:     cache,
-		breakers:  breakers,
-		cfg:       cfg,
-		limiter:   limiter,
-		startedAt: time.Now(),
+		db:          db,
+		cache:       cache,
+		breakers:    breakers,
+		cfg:         cfg,
+		limiter:     limiter,
+		usageWriter: usageWriter,
+		startedAt:   time.Now(),
 	}
 }
 
@@ -155,5 +157,42 @@ func (h *SystemStatusHandler) Status(c *gin.Context) {
 		},
 		"access_keys": akCount,
 		"breakers":    merged,
+		"usage_writer": h.usageWriterStats(),
 	})
+}
+
+// usageWriterStats 读取异步落库器的运行时统计
+// 内存版返回 queue_depth，Redis 版返回后端类型标记
+func (h *SystemStatusHandler) usageWriterStats() gin.H {
+	if h.usageWriter == nil {
+		return gin.H{"enabled": false}
+	}
+	// 类型断言：判断底层是内存版还是 Redis 版
+	switch w := h.usageWriter.(type) {
+	case *memoryUsageWriter:
+		enqueued, persisted, dropped, failed, depth := w.Stats()
+		return gin.H{
+			"enabled":       true,
+			"backend":       "memory",
+			"enqueued":      enqueued,
+			"persisted":     persisted,
+			"dropped":       dropped,
+			"write_failed":  failed,
+			"queue_depth":   depth,
+		}
+	case *RedisStreamUsageWriter:
+		enqueued, persisted, dropped, failed := w.Stats()
+		return gin.H{
+			"enabled":      true,
+			"backend":      "redis_stream",
+			"stream":       RedisStreamKey,
+			"group":        RedisStreamGroup,
+			"enqueued":     enqueued,
+			"persisted":    persisted,
+			"dropped":      dropped,
+			"write_failed": failed,
+		}
+	default:
+		return gin.H{"enabled": true, "backend": "unknown"}
+	}
 }
