@@ -100,9 +100,10 @@ func auditMeta(c *gin.Context) (reqID string, akID uint, akName string, ip strin
 }
 
 // relayStartKey / relayFirstRespKey 请求计时存 context 的 key
+// （relayAttemptsKey 与尝试链辅助函数在 attempts.go）
 const (
-	relayStartKey      = "relayStart"
-	relayFirstRespKey  = "relayFirstResp"
+	relayStartKey     = "relayStart"
+	relayFirstRespKey = "relayFirstResp"
 )
 
 // markFirstResponse 记录"首响应"时刻（只记一次）
@@ -169,6 +170,7 @@ func (h *RelayHandler) recordUsage(c *gin.Context, ch model.Channel, modelName s
 		Status:           200, // 能走到落账 = 转发成功（HTTP 200 语义）
 		DurationMs:       durationMs,
 		FirstResponseMs:  firstRespMs,
+		AttemptsJSON:     attemptsFromCtx(c), // 故障转移链：单次成功=1条；换过渠道=多条
 	}
 	if err := h.db.Create(&logEntry).Error; err != nil {
 		RequestLogf(c, "[usage] 计费落库失败: %v", err)
@@ -194,6 +196,7 @@ func logUsageFailure(db *gorm.DB, c *gin.Context, ch model.Channel, modelName st
 		Error:            errMsg,
 		DurationMs:       durationMs,
 		FirstResponseMs:  firstRespMs, // 失败分支未 mark → 0（语义：没等到任何响应）
+		AttemptsJSON:     attemptsFromCtx(c),
 	}
 	if err := db.Create(&logEntry).Error; err != nil {
 		RequestLogf(c, "[usage] 失败落库失败: %v", err)
@@ -248,31 +251,42 @@ func upstreamErrorSummary(body []byte) string {
 //     n=0       → 渠道A（概率 1/6）
 //     n=1,2     → 渠道B（概率 2/6）
 //     n=3,4,5   → 渠道C（概率 3/6）
-func (h *RelayHandler) pickChannel(excluded map[uint]struct{}, modelName string) (model.Channel, error) {
+//
+// 排障日志：每个候选渠道被过滤时都打印原因（已试/模型不匹配/熔断/禁用），
+//   否则"无可用渠道"时只能瞎猜是哪个条件挡住的。
+func (h *RelayHandler) pickChannel(c *gin.Context, excluded map[uint]struct{}, modelName string) (model.Channel, error) {
 	// ① 从内存快照读启用渠道（无锁；替代每请求查库——配置热更新的读路径）
 	list := h.cache.List()
 
 	// ② 三层过滤：已试失败排除 + 按模型路由 + 熔断状态
 	//    （熔断：连续失败 N 次的渠道被摘除，冷却期/探活恢复后才重新入池）
 	candidates := make([]model.Channel, 0, len(list))
+	now := time.Now()
+	RequestLogf(c, "[pick] 候选池扫描（模型=%s）：共 %d 个启用渠道", modelName, len(list))
 	for _, ch := range list {
-		if _, tried := excluded[ch.ID]; tried { // 这个渠道已经试过且失败 → 排除
+		// 过滤原因①：已经试过且失败
+		if _, tried := excluded[ch.ID]; tried {
+			RequestLogf(c, "[pick]   渠道 id=%d %s：已试失败，排除", ch.ID, ch.Name)
 			continue
 		}
-		// 路由层：渠道声明了 models 列表，但客户端请求的模型不在其中 → 不参与调度
-		// （渠道 models 为空 = 支持所有模型，兼容旧渠道无需迁移）
+		// 过滤原因②：模型白名单不匹配（models 为空=支持所有，不过滤）
 		if modelName != "" && ch.Models != "" && !containsModel(ch.Models, modelName) {
+			RequestLogf(c, "[pick]   渠道 id=%d %s：models=%q 不含 %q，跳过", ch.ID, ch.Name, ch.Models, modelName)
 			continue
 		}
-		// 熔断层：OPEN（冷却中）或 HALF_OPEN（探测已放行）→ 跳过
-		if !h.breakers.allow(ch.ID, time.Now()) {
+		// 过滤原因③：熔断 OPEN/冷却中
+		if !h.breakers.allow(ch.ID, now) {
+			RequestLogf(c, "[pick]   渠道 id=%d %s：熔断冷却中，跳过", ch.ID, ch.Name)
 			continue
 		}
-		if ch.Weight < 1 { // 防止 0 权重渠道永远不会被选中
+		// 兜底：权重为 0 的渠道不参与调度（防止死循环）
+		if ch.Weight < 1 {
 			ch.Weight = 1
 		}
 		candidates = append(candidates, ch)
+		RequestLogf(c, "[pick]   渠道 id=%d %s：入候选池（weight=%d）", ch.ID, ch.Name, ch.Weight)
 	}
+	RequestLogf(c, "[pick] 最终候选 %d 个", len(candidates))
 	if len(candidates) == 0 {
 		return model.Channel{}, gorm.ErrRecordNotFound // 没有可用的了（全试完/无启用渠道）
 	}
@@ -705,6 +719,8 @@ func flushWriter(c *gin.Context) {
 func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 	// 计时起点：请求一进来就记（限流/鉴权失败也算总耗时的一部分）
 	c.Set(relayStartKey, time.Now())
+	// 初始化故障转移尝试链：每换一次渠道 append 一跳，最终随流水落库
+	initAttempts(c)
 
 	// ⓪ W3 限流：在解析 body 之前先掐住（省得为被拒绝的请求白做 JSON 解析）
 	// key 取调用方标识（Authorization Bearer / X-User-Key），兜底客户端 IP
@@ -763,7 +779,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 	//    所以：成功拿到响应 → 立即锁定并透传，绝不再切换（尤其 SSE 流式）
 	tried := make(map[uint]struct{}) // 已尝试过的渠道集合（去重，防止无限循环）
 	for {
-		ch, err := h.pickChannel(tried, reqMeta.Model) // 路由层：按客户端 model 过滤候选渠道
+		ch, err := h.pickChannel(c, tried, reqMeta.Model) // 路由层：按客户端 model 过滤候选渠道
 		if err != nil {
 			// 没有候选渠道了：区分"从来没渠道"和"全试完都失败"
 			if len(tried) > 0 {
@@ -777,6 +793,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			return
 		}
 		RequestLogf(c, "[relay] 尝试渠道 id=%d name=%s weight=%d → %s", ch.ID, ch.Name, ch.Weight, ch.BaseURL)
+		attemptStart := time.Now() // 这一跳尝试的计时起点（发出请求前记）
 
 		// 构造发给上游的请求
 		// 上游地址 = 渠道 base_url + 协议路径：
@@ -798,6 +815,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		apiKey, err := h.enc.DecryptOrRaw(ch.APIKey)
 		if err != nil {
 			RequestLogf(c, "[relay] 渠道 id=%d 密钥解密失败: %v，尝试下一个", ch.ID, err)
+			appendAttempt(c, ch, 0, time.Since(attemptStart).Milliseconds(), "密钥解密失败: "+err.Error(), true)
 			tried[ch.ID] = struct{}{}
 			h.breakers.recordFailure(ch.ID, time.Now()) // 密钥坏了也算渠道故障，累计熔断
 			continue
@@ -810,6 +828,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			upBody, err = convertToAnthropic(body)
 			if err != nil {
 				RequestLogf(c, "[relay] 渠道 id=%d 请求转换失败: %v，尝试下一个", ch.ID, err)
+				appendAttempt(c, ch, 0, time.Since(attemptStart).Milliseconds(), "请求转换失败: "+err.Error(), true)
 				tried[ch.ID] = struct{}{}
 				continue
 			}
@@ -837,6 +856,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		if err != nil {
 			// 网络层失败（连不上/超时）→ 记入已试 + 熔断计数，换下一个渠道
 			RequestLogf(c, "[relay] 渠道 id=%d 网络失败: %v，尝试下一个", ch.ID, err)
+			appendAttempt(c, ch, 0, time.Since(attemptStart).Milliseconds(), "网络失败: "+err.Error(), true)
 			tried[ch.ID] = struct{}{}
 			h.breakers.recordFailure(ch.ID, time.Now())
 			continue
@@ -846,6 +866,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		if upResp.StatusCode >= 500 {
 			// 5xx = 上游服务器故障 → 值得换渠道重试；同时累计熔断计数
 			RequestLogf(c, "[relay] 渠道 id=%d 返回 %d，尝试下一个", ch.ID, upResp.StatusCode)
+			appendAttempt(c, ch, upResp.StatusCode, time.Since(attemptStart).Milliseconds(), "", true)
 			upResp.Body.Close() // 显式关闭，释放连接（不用 defer——循环里会累积）
 			tried[ch.ID] = struct{}{}
 			h.breakers.recordFailure(ch.ID, time.Now())
@@ -856,6 +877,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 		//   为什么 4xx 不重试？400 是请求体坏、404 是路径错、401 是密钥错——
 		//   换任何渠道结果都一样，重试纯属浪费
 		//   ⚠️ 从此处起渠道已锁定：响应开始流向客户端，故障转移到此为止
+		appendAttempt(c, ch, upResp.StatusCode, time.Since(attemptStart).Milliseconds(), "", false)
 		defer upResp.Body.Close()
 		h.breakers.recordSuccess(ch.ID) // 拿到响应 = 渠道是通的，记成功清失败计数
 		RequestLogf(c, "[relay] 渠道 id=%d 返回 %d，锁定并透传", ch.ID, upResp.StatusCode)

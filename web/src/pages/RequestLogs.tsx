@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, Fragment } from 'react'
 import {
   fetchChannels,
   fetchLogFiles,
@@ -104,6 +104,36 @@ function CopyBtn({ text, label }: { text: string; label: string }) {
   )
 }
 
+/** Attempt 一次渠道尝试（与后端 model.Attempt 对齐） */
+interface Attempt {
+  sequence: number
+  channel_id: number
+  channel_name: string
+  provider: string
+  status_code: number // 0 = 没拿到响应（网络错误/解密失败）
+  duration_ms: number
+  error?: string
+  will_retry: boolean // true=换渠道重试；false=最终结果
+}
+
+/** 解析 attempts_json（后端存的 JSON 串）；失败/空返回空数组 */
+function parseAttempts(raw?: string): Attempt[] {
+  if (!raw) return []
+  try {
+    const arr = JSON.parse(raw)
+    return Array.isArray(arr) ? (arr as Attempt[]) : []
+  } catch {
+    return []
+  }
+}
+
+/** 尝试链徽标颜色：成功(will_retry=false)绿，失败待重试黄/红 */
+function attemptColor(a: Attempt) {
+  if (!a.will_retry) return 'var(--ok)'           // 最终结果
+  if (a.status_code === 0 || a.status_code >= 500) return 'var(--danger)' // 网络/5xx
+  return '#fbbf24'                                 // 其他失败待重试
+}
+
 export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
   const [items, setItems] = useState<UsageLogItem[]>([])
   const [total, setTotal] = useState(0)
@@ -128,6 +158,7 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
   const [fAccessKey, setFAccessKey] = useState('')
   const [fClientIP, setFClientIP] = useState('')
   const [fDays, setFDays] = useState('7')
+  const [expandedId, setExpandedId] = useState<number | null>(null) // 展开尝试链的行 id
 
   const load = useCallback(async () => {
     try {
@@ -439,6 +470,7 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>模型</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>Provider</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>状态</th>
+                <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>尝试</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>耗时</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500 }}>错误</th>
                 <th style={{ padding: '8px 8px', borderBottom: '1px solid var(--border)', fontWeight: 500, textAlign: 'right' }}>输入</th>
@@ -448,8 +480,12 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
               </tr>
             </thead>
             <tbody>
-              {items.map((it) => (
-                <tr key={it.id} style={{ borderBottom: '1px solid var(--border)' }}>
+              {items.map((it) => {
+                const attempts = parseAttempts(it.attempts_json)
+                const colCount = 15 // 表头列数（加"尝试"后=15）
+                return (
+                <Fragment key={it.id}>
+                <tr style={{ borderBottom: '1px solid var(--border)' }}>
                   <td style={{ padding: '9px 8px', whiteSpace: 'nowrap', color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums' }}>{fmtTime(it.created_at)}</td>
                   <td style={{ padding: '9px 8px', maxWidth: 112 }}>
                     <span className="req-copy-cell" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -495,6 +531,33 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
                       {it.status == null || it.status === 0 ? '—' : `HTTP ${it.status}`}
                     </span>
                   </td>
+                  {/* 尝试链列：>1 次显示徽标（可点开展开）；=1 次/无尝试链显示 — */}
+                  <td style={{ padding: '9px 8px', whiteSpace: 'nowrap' }}>
+                    {(() => {
+                      const attempts = parseAttempts(it.attempts_json)
+                      if (attempts.length <= 1) return <span className="muted" style={{ fontSize: 11 }}>—</span>
+                      const retried = attempts.filter((a) => a.will_retry).length
+                      const isOpen = expandedId === it.id
+                      return (
+                        <button
+                          onClick={() => setExpandedId(isOpen ? null : it.id)}
+                          title={isOpen ? '收起尝试链' : `展开 ${attempts.length} 次尝试`}
+                          style={{
+                            border: '1px solid rgba(139,92,246,0.35)',
+                            background: isOpen ? 'rgba(139,92,246,0.15)' : 'rgba(139,92,246,0.06)',
+                            color: 'var(--accent-soft)',
+                            fontSize: 10.5,
+                            padding: '2px 8px',
+                            borderRadius: 10,
+                            cursor: 'pointer',
+                            fontVariantNumeric: 'tabular-nums',
+                          }}
+                        >
+                          {retried > 0 ? `${retried} 次重试` : `${attempts.length} 次`} {isOpen ? '▾' : '▸'}
+                        </button>
+                      )
+                    })()}
+                  </td>
                   <td style={{ padding: '9px 8px', whiteSpace: 'nowrap', fontSize: 11.5, fontVariantNumeric: 'tabular-nums' }} title={it.duration_ms != null && it.first_response_ms != null ? `总耗时 ${it.duration_ms}ms · 首响应 ${it.first_response_ms}ms` : undefined}>
                     {it.duration_ms != null && it.duration_ms > 0 ? (
                       <>
@@ -527,7 +590,60 @@ export default function RequestLogs({ refreshTick }: { refreshTick: number }) {
                   <td style={{ padding: '9px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>{it.total_tokens}</td>
                   <td style={{ padding: '9px 8px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>{fmtCost(it.cost)}</td>
                 </tr>
-              ))}
+                {/* 展开行：尝试链详情（跨全部列） */}
+                {expandedId === it.id && attempts.length > 0 && (
+                  <tr style={{ borderBottom: '1px solid var(--border)', background: 'rgba(139,92,246,0.04)' }}>
+                    <td colSpan={colCount} style={{ padding: '10px 14px' }}>
+                      <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                        <div style={{ marginBottom: 8, fontWeight: 600, fontSize: 11.5, letterSpacing: '0.04em' }}>
+                          故障转移链 · 共 {attempts.length} 跳
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+                          {attempts.map((a, idx) => (
+                            <Fragment key={a.sequence}>
+                              {/* 跳之间的箭头 */}
+                              {idx > 0 && (
+                                <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>→</span>
+                              )}
+                              <span
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: 6,
+                                  padding: '4px 10px',
+                                  borderRadius: 12,
+                                  border: `1px solid ${attemptColor(a)}55`,
+                                  background: `${attemptColor(a)}11`,
+                                  fontSize: 11.5,
+                                  fontVariantNumeric: 'tabular-nums',
+                                }}
+                                title={a.error || undefined}
+                              >
+                                <span style={{ color: 'var(--text-muted)' }}>#{a.sequence}</span>
+                                <span style={{ fontWeight: 600 }}>{a.channel_name || `渠道 #${a.channel_id}`}</span>
+                                <span style={{ color: attemptColor(a) }}>
+                                  {a.status_code > 0 ? `HTTP ${a.status_code}` : '网络错误'}
+                                </span>
+                                <span className="muted">{fmtDur(a.duration_ms)}</span>
+                                {a.error && (
+                                  <span style={{ color: 'var(--danger)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                    {a.error}
+                                  </span>
+                                )}
+                                {a.will_retry && (
+                                  <span style={{ color: '#fbbf24', fontSize: 10 }}>(重试)</span>
+                                )}
+                              </span>
+                            </Fragment>
+                          ))}
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
+                )
+              })}
             </tbody>
           </table>
         )}

@@ -241,6 +241,7 @@ export interface UsageLogItem {
   error?: string // 失败时的错误摘要（成功为空）
   duration_ms?: number // 网关总耗时（毫秒）
   first_response_ms?: number // 首响应延迟（流式=首个 token；非流式=上游响应到达）
+  attempts_json?: string // 故障转移尝试链 JSON 字符串（单次成功=1条；换过渠道=多条）
   created_at: string
 }
 

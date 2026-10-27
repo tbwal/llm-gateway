@@ -226,3 +226,5 @@ Authorization: Bearer sk-test-123
 Content-Type: application/json
 
 {"model":"deepseek-v1-flash","messages":[{"role":"user","content":"你好"}],  "stream": true}
+
+
