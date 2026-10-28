@@ -123,7 +123,7 @@ export async function createAccessKey(body: { name: string; scopes?: string }): 
     body: JSON.stringify(body),
   })
   const resp = await res.json()
-  if (resp.code !== 0) throw new Error(resp.message)
+  if (!res.ok) throw new Error(resp.message || `HTTP ${res.status}`)
   return resp.data
 }
 
@@ -138,14 +138,14 @@ export async function updateAccessKey(
     body: JSON.stringify(body),
   })
   const resp = await res.json()
-  if (resp.code !== 0) throw new Error(resp.message)
+  if (!res.ok) throw new Error(resp.message || `HTTP ${res.status}`)
 }
 
 /** 删除（彻底吊销） */
 export async function deleteAccessKey(id: number): Promise<void> {
   const res = await fetch(`/api/access-keys/${id}`, { method: 'DELETE' })
   const resp = await res.json()
-  if (resp.code !== 0) throw new Error(resp.message)
+  if (!res.ok) throw new Error(resp.message || `HTTP ${res.status}`)
 }
 
 // ===== 系统状态 =====
@@ -344,4 +344,50 @@ export function fmtFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`
+}
+
+// ===== 模型单价管理 =====
+export interface ModelPricing {
+  id: number
+  model_name: string
+  input_price: number  // 元 / 1K token
+  output_price: number // 元 / 1K token
+  enabled: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+interface PricingListResp { code: number; message: string; data: ModelPricing[] }
+
+export async function fetchModelPricing(): Promise<ModelPricing[]> {
+  const resp = await getJSON<PricingListResp>('/api/model-pricing')
+  return resp.data || []
+}
+
+export async function createModelPricing(body: Partial<ModelPricing>): Promise<ModelPricing> {
+  const res = await fetch('/api/model-pricing', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const j = await res.json()
+  if (!res.ok) throw new Error(j.message || `HTTP ${res.status}`)
+  return j.data
+}
+
+export async function updateModelPricing(id: number, body: Partial<ModelPricing>): Promise<ModelPricing> {
+  const res = await fetch(`/api/model-pricing/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const j = await res.json()
+  if (!res.ok) throw new Error(j.message || `HTTP ${res.status}`)
+  return j.data
+}
+
+export async function deleteModelPricing(id: number): Promise<void> {
+  const res = await fetch(`/api/model-pricing/${id}`, { method: 'DELETE' })
+  const j = await res.json()
+  if (!res.ok) throw new Error(j.message || `HTTP ${res.status}`)
 }

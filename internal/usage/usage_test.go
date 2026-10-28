@@ -1,6 +1,13 @@
 package usage
 
-import "testing"
+import (
+	"testing"
+
+	"llm-gateway/internal/model"
+
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+)
 
 // TestEstimateTokens 估算：ASCII 4 字符≈1 token，中文 1 字≈1 token
 func TestEstimateTokens(t *testing.T) {
@@ -20,8 +27,31 @@ func TestEstimateTokens(t *testing.T) {
 	}
 }
 
+// newTestPricing 测试用内存数据库构造 PricingCache
+func newTestPricing(t *testing.T) *PricingCache {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&model.ModelPricing{}); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	db.Create(&model.ModelPricing{
+		ModelName: "mock-upstream", InputPrice: 0.001, OutputPrice: 0.002, Enabled: true,
+	})
+	db.Create(&model.ModelPricing{
+		ModelName: "claude-3-5-sonnet", InputPrice: 0.022, OutputPrice: 0.088, Enabled: true,
+	})
+	c := NewPricingCache(db)
+	SetPricingCache(c)
+	return c
+}
+
 // TestCalcCost 已知模型单价计算
 func TestCalcCost(t *testing.T) {
+	newTestPricing(t)
+
 	// mock-upstream: input 0.001 元/1K, output 0.002 元/1K
 	// 1000 input + 2000 output → 0.001*1 + 0.002*2 = 0.005
 	cost := CalcCost("mock-upstream", 1000, 2000)
@@ -36,11 +66,19 @@ func TestCalcCost(t *testing.T) {
 	}
 }
 
-// TestLookupPricePrefix 前缀匹配：新模型不至于掉到默认价
+// TestLookupPrice 精确匹配 + 默认兜底
 func TestLookupPricePrefix(t *testing.T) {
-	// claude-3-7-sonnet 不存在精确表 → 前缀 claude- → 用 claude-3-5-sonnet 的价
-	p := lookupPrice("claude-3-7-sonnet")
-	if p.input != prices["claude-3-5-sonnet"].input {
-		t.Fatalf("前缀匹配失败: %+v", p)
+	c := newTestPricing(t)
+
+	// 精确匹配
+	p := c.Lookup("mock-upstream")
+	if p.input != 0.001 {
+		t.Fatalf("精确匹配失败: input=%f, want 0.001", p.input)
+	}
+
+	// 未配置的模型 → 默认兜底 0.002
+	p2 := c.Lookup("unknown-model")
+	if p2.input != 0.002 {
+		t.Fatalf("默认兜底失败: input=%f, want 0.002", p2.input)
 	}
 }

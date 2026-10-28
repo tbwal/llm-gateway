@@ -19,6 +19,7 @@ import (
 	"llm-gateway/internal/handler"
 	"llm-gateway/internal/model"
 	"llm-gateway/internal/ratelimit"
+	"llm-gateway/internal/usage"
 )
 
 // New 创建 gin 引擎并注册全部路由
@@ -36,6 +37,22 @@ func New(db *gorm.DB, enc crypto.Service, cfg config.Config) *gin.Engine {
 	// 渠道配置缓存（W2 热更新）：原子快照无锁读；CRUD 主动刷新 + 30s 轮询兜底
 	cache := handler.NewChannelCache(db, 30*time.Second)
 	cache.Start()
+
+	// 模型单价表：首次启动写入默认单价 + 内存缓存热更新
+	// （建表已在 storage.InitDB 里 AutoMigrate，这里只做数据初始化）
+	usage.SeedDefaults(db)
+	pricing := usage.NewPricingCache(db)
+	usage.SetPricingCache(pricing)
+
+	// 模型单价管理（CRUD）
+	pr := handler.NewModelPricingHandler(db, pricing)
+	prg := r.Group("/api/model-pricing")
+	{
+		prg.GET("", pr.List)
+		prg.POST("", pr.Create)
+		prg.PUT("/:id", pr.Update)
+		prg.DELETE("/:id", pr.Delete)
+	}
 
 	// 渠道管理（第 3 步：完整 CRUD）
 	ch := handler.NewChannelHandler(db, enc, cache) // 依赖注入：把 db、加密服务、缓存传给渠道处理器

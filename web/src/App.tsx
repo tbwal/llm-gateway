@@ -7,6 +7,7 @@ import Channels from './pages/Channels'
 import UsageBoard from './pages/UsageBoard'
 import AccessKeys from './pages/AccessKeys'
 import SystemStatusPage from './pages/SystemStatus'
+import ModelPricingPage from './pages/ModelPricing'
 import RequestLogs from './pages/RequestLogs'
 import Playground from './pages/Playground'
 
@@ -14,6 +15,7 @@ import Playground from './pages/Playground'
 const NAV_ITEMS = [
   { path: '/', label: '总览', icon: 'dashboard' },
   { path: '/channels', label: '渠道管理', icon: 'tag' },
+  { path: '/pricing', label: '模型单价', icon: 'chart' },
   { path: '/usage', label: '用量看板', icon: 'chart' },
   { path: '/access-keys', label: 'AccessKey', icon: 'key' },
   { path: '/system', label: '系统状态', icon: 'activity' },
@@ -81,6 +83,7 @@ export default function App() {
         <Routes location={location}>
           <Route path="/" element={<Dashboard refreshTick={refreshing} />} />
           <Route path="/channels" element={<Channels refreshTick={refreshing} />} />
+          <Route path="/pricing" element={<ModelPricingPage refreshTick={refreshing} />} />
           <Route path="/usage" element={<UsageBoard refreshTick={refreshing} />} />
           <Route path="/access-keys" element={<AccessKeys refreshTick={refreshing} />} />
           <Route path="/system" element={<SystemStatusPage refreshTick={refreshing} />} />

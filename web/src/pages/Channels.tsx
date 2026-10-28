@@ -172,13 +172,23 @@ export default function Channels({ refreshTick }: { refreshTick: number }) {
               <div style={{ minWidth: '150px' }}>
                 <div style={{ fontWeight: 600, fontSize: '14px' }}>{c.name}</div>
                 <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6, marginTop: 2 }}>
-                  {providerLabel(c.provider)}
+                  <span
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 3,
+                      color: 'var(--accent)', border: '1px solid rgba(139,92,246,0.35)',
+                      background: 'rgba(139,92,246,0.10)', borderRadius: 6, padding: '1px 6px',
+                      fontSize: 10.5, fontWeight: 500,
+                    }}
+                    title="上游协议类型"
+                  >
+                    {providerLabel(c.provider)}
+                  </span>
                   {c.api_key_set ? (
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, color: 'var(--ok)', border: '1px solid rgba(74,222,128,0.3)', background: 'rgba(74,222,128,0.08)', borderRadius: 6, padding: '0 5px', fontSize: 10.5 }}>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, color: 'var(--ok)', border: '1px solid rgba(74,222,128,0.3)', background: 'rgba(74,222,128,0.08)', borderRadius: 6, padding: '1px 5px', fontSize: 10.5 }}>
                       <Icon name="shield" size={9} /> 已配置
                     </span>
                   ) : (
-                    <span style={{ color: 'var(--text-muted)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 6, padding: '0 5px', fontSize: 10.5 }}>
+                    <span style={{ color: 'var(--text-muted)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 6, padding: '1px 5px', fontSize: 10.5 }}>
                       未配置密钥
                     </span>
                   )}
@@ -188,8 +198,24 @@ export default function Channels({ refreshTick }: { refreshTick: number }) {
                 <div style={{ fontSize: '12.5px', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {c.base_url || '(默认地址)'}
                 </div>
-                <div style={{ fontSize: '12px', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  models: {c.models || '(全部)'}
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 3 }}>
+                  {c.models ? (
+                    c.models.split(',').map((m) => m.trim()).filter(Boolean).map((m) => (
+                      <span
+                        key={m}
+                        title="该渠道支持的模型"
+                        style={{
+                          fontSize: 10.5, color: 'var(--text-secondary)',
+                          border: '1px solid rgba(255,255,255,0.12)', background: 'rgba(255,255,255,0.04)',
+                          borderRadius: 6, padding: '1px 6px',
+                        }}
+                      >
+                        {m}
+                      </span>
+                    ))
+                  ) : (
+                    <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>(全部模型)</span>
+                  )}
                 </div>
               </div>
               <span style={{ fontSize: '12.5px', color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums' }}>

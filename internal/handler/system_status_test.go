@@ -59,7 +59,7 @@ func TestSystemStatus(t *testing.T) {
 		RateLimitStore:   "memory",
 		RedisAddr:        "localhost:6379",
 		SecretKey:        "", // 未配置 → secret_key_set 应为 false
-	}, newTestLimiter(t)) // 真实 memory 限流器：enabled=true、limit=60
+	}, newTestLimiter(t), nil) // usageWriter=nil：测试环境无异步落库
 	r := gin.New()
 	r.GET("/api/system/status", h.Status)
 
