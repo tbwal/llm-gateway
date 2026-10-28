@@ -36,8 +36,8 @@ export default function Dashboard({ refreshTick }: { refreshTick: number }) {
         total_tokens: s.summary.total_tokens,
         cost: s.summary.cost,
       })
-      setDaily(d.rows)
-      setBreakdown(b.rows)
+      setDaily(d.rows ?? [])
+      setBreakdown(b.rows ?? [])
       setChannels(c)
     } catch (e) {
       setErr(e instanceof Error ? e.message : '加载失败')

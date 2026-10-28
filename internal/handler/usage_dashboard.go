@@ -109,6 +109,11 @@ func (d *UsageDashboard) Breakdown(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// 空表时 rows 是 nil slice → JSON 会序列化成 null 而非 []（前端 .length 直接崩）。
+	// 契约：列表字段空必须返回 []，统一在这里兜底。
+	if rows == nil {
+		rows = []breakdownItem{}
+	}
 	c.JSON(http.StatusOK, gin.H{"days": days, "group": label, "rows": rows})
 }
 
@@ -140,6 +145,10 @@ func (d *UsageDashboard) Daily(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	// 同 Breakdown：空表返回 [] 而非 null（前端 daily.length 依赖数组）
+	if rows == nil {
+		rows = []dailyItem{}
 	}
 	c.JSON(http.StatusOK, gin.H{"days": days, "rows": rows})
 }
