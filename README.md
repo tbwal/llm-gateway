@@ -31,7 +31,8 @@ AccessKey 签发 / 系统状态 / 请求日志 / 调试台，支持在页面上�
   - [9. 转发连接池与分层超时](#9-转发连接池与分层超时)
   - [10. 滑动窗口限流（memory / Redis）](#10-滑动窗口限流memory--redis)
   - [11. Token 计费落库（流水表）](#11-token-计费落库流水表)
-  - [11.1 计费落库的异步化（请求处理与记账解耦）](#111-计费落库的异步化可优化点请求处理与记账解耦)
+  - [11.1 计费落库的异步化（内存 channel / Redis Stream 双后端）](#111-计费落库的异步化内存-channel--redis-stream-双后端)
+  - [11.2 模型单价管理（DB 配置化 + 内存缓存热更新）](#112-模型单价管理db-配置化--内存缓存热更新)
   - [12. 用量看板 API（查询时聚合）](#12-用量看板-api查询时聚合)
   - [13. AccessKey 鉴权（调用方可信身份）](#13-accesskey-鉴权调用方可信身份)
   - [14. 限流次数 Web 动态设置（settings 持久化）](#14-限流次数-web-动态设置settings-持久化)
@@ -216,7 +217,8 @@ curl http://localhost:8080/v1/chat/completions \
 | `RATE_LIMIT_ENABLED` | 开（显式 `"false"` 关） | 是否开启限流 |
 | `RATE_LIMIT_PER_MIN` | `60` | 每调用方每分钟最大请求数（滑动窗口）。**仅启动默认**——在管理台保存过限流次数后，settings 表的值覆盖它（重启保留） |
 | `RATE_LIMIT_STORE` | `memory` | `memory`（本地单机）/ `redis`（多实例共享） |
-| `REDIS_ADDR` | `localhost:6379` | `store=redis` 时的 Redis 地址 |
+| `REDIS_ADDR` | `localhost:6379` | `store=redis` 或日志后端 `=redis` 时的 Redis 地址 |
+| `USAGE_LOG_BACKEND` | `memory` | 计费落库后端：`memory`（进程内 channel）/ `redis`（Redis Streams 消费组） |
 | `REQUEST_LOG_DIR` | `data/request-logs` | 请求级日志根目录（每条请求一个文件：`{dir}/{date}/{requestID}.log`） |
 
 示例：`$env:LLM_GATEWAY_SECRET_KEY = "<64 位 hex>"; $env:RATE_LIMIT_PER_MIN = 3; go run ./cmd/server`
@@ -622,16 +624,20 @@ PEXPIRE key window+1000             -- 防 key 永不删除
 - 非 ASCII（中文等）1 字 ≈ 1 token。
 - 口径只求量级正确（真实精度用 tiktoken，这里兜底够用）。
 
-**计价 `CalcCost`**：模型单价表（元/1K token）三级匹配：
-精确模型名 → 前缀匹配（`claude-*`/`gpt-*`/`deepseek-*`）→ 默认价兜底。
+**计价 `CalcCost`**：单价从 `model_pricing` 表（管理台可配，元/1K token）经
+`PricingCache` 内存缓存读取，两级匹配：精确模型名 → 默认价兜底
+（未配置的模型按默认低价 0.002/0.002 计费，管理台显式添加即可精确计费）。
 
 > 踩坑记录：估算 completion 不能按"整个响应体 JSON"——
 > id/object/role/finish_reason 这些 JSON 骨架不是模型输出，会把 completion 高估 2~3 倍；
 > 三个分支统一估"模型输出的纯文本"。
 
-### 11.1 计费落库的异步化（可优化点：请求处理与记账解耦）
+### 11.1 计费落库的异步化（内存 channel / Redis Stream 双后端）
 
-**现状（同步记账）**：`recordUsage` / `logUsageFailure` 的 `db.Create` 在 handler 返回**之前**执行，
+**已实现**：`internal/handler/usage_writer.go`（内存版）+ `usage_writer_redis.go`（Redis Stream 版），
+通过 `USAGE_LOG_BACKEND` 环境变量切换（默认 `memory`）。
+
+**为什么异步**：同步记账时 `recordUsage` 的 `db.Create` 在 handler 返回**之前**执行，
 客户端要等落库完成才收到最终响应。三个具体问题：
 
 | 问题 | 说明 |
@@ -654,20 +660,47 @@ PEXPIRE key window+1000             -- 防 key 永不删除
 "随机小写 + N 次等确认"合并成 1 次"顺序大写 + 1 次等确认"——数据库本质
 仍要落盘，但请求不再等这个确认。
 
-**代价**：记账有几秒延迟（看板/日志略滞后）；进程崩溃丢内存队列中的事件
-（上 Kafka 后事件持久化可重放）。
+**两个后端对比（面试讲点）**：
 
-**演进路径（面试讲点，不一步上 Kafka）**：
+| 维度 | memory（进程内 channel） | redis（Redis Streams） |
+|---|---|---|
+| 依赖 | 零 | 需要 Redis |
+| 队列 | 内存 channel，容量 256，满则丢弃计数（fail-open） | Redis Stream `usage_logs` + 消费组 `logs-worker` |
+| 批量 | 攒 32 条 / 500ms flush | XREADGROUP 最多读 32 条，阻塞 500ms |
+| 可靠性 | 进程崩溃丢队列中未落库事件 | 未 ACK 的消息留在 pending 列表，重启可重读 |
+| 多实例 | 各自独立队列（互不相通） | 共享 Stream，消费组内多实例分担消息 |
+| 关闭 | Close() 优雅 drain 剩余 batch 再退出 | 同样 drain + ACK |
 
-```
-① 进程内 Go channel + worker 批量落库   ← 零依赖，先解决"异步落库"
-② Redis Streams                        ← 轻量级分布式队列（项目已引入 Redis）
-③ Apache Kafka                         ← 多实例 / 高 QPS / 需要事件重放时才上
-```
+系统状态页「异步落库」卡片展示后端类型 + 入队数 / 已落库数 / 丢弃数 / 写失败数 / 队列深度。
 
 > 面试讲法："同步记账 = 让算账的人挡住客人的门。响应完成是主流程，记账是
 > 附属流程，附属流程不该决定主流程何时结束。解耦 = 请求路径只描述事实并
 > 投递，后台慢慢算——这是队列存在的意义。"
+
+### 11.2 模型单价管理（DB 配置化 + 内存缓存热更新）
+
+`internal/model/model_pricing.go` + `internal/usage/pricing_cache.go` + `internal/handler/model_pricing.go`。
+
+**为什么配置化**：单价原本硬编码在 `internal/usage/price.go` 的 map 里，改价格 = 改代码 + 重启。
+单价是**低频变更的高频读**数据——放进 DB + 内存缓存，管理台改价立即生效。
+
+```
+管理台 CRUD ──▶ model_pricing 表 ──▶ Refresh() 全量加载 ──▶ PricingCache 内存快照
+                                                              │
+请求转发时 CalcCost ──▶ Lookup(model)（RWMutex 无锁读）──▶ 精确匹配 → 默认兜底
+```
+
+设计要点：
+
+- **表**：`model_pricing`（model_name 唯一索引 / input_price / output_price / enabled）
+- **缓存**：RWMutex 保护快照 map，读路径无锁；管理台 CRUD 后主动 `Refresh()`
+- **种子数据**：首次启动（表为空）写入 7 条默认单价（deepseek-chat 0.14/0.28、gpt-4o 0.018/0.072、claude-3-5-sonnet 0.022/0.088 等）
+- **查找策略**：精确匹配 → 默认兜底（0.002/0.002），**不做前缀匹配**——新模型未配单价显式走默认价，管理台添加后精确计费，避免"偷偷套用同厂商价格"的隐性计费错误
+- **建表位置**：统一收口 `storage.InitDB` 的 AutoMigrate（不散落在 router）
+- **前端**：`/pricing`「模型单价」页——列表 / 新增 / 编辑 / 启停 / 删除（自定义确认弹窗）
+
+> 面试讲点：单价缓存复用渠道缓存的同一套模式（快照 + RWMutex + CRUD 后主动刷新），
+> 面试可对比"每次请求查 DB"（慢）vs"缓存 + 失效刷新"（快）vs"配置中心推送"（生产演进方向）。
 
 ### 12. 用量看板 API（查询时聚合）
 
@@ -798,16 +831,17 @@ SSE 中断 / 协议转换失败 / 读响应体失败 / 上游 ≥400 / AccessKey
 
 ### 16. Web 管理台（React 液态玻璃）
 
-`web/`（React 19 + Vite + TS + framer-motion）。七个页面，全部通过 `/api/*` 与网关通信
+`web/`（React 19 + Vite + TS + framer-motion）。八个页面，全部通过 `/api/*` 与网关通信
 （vite 代理转发到 :8080）：
 
 | 路由 | 页面 | 数据源 |
 |---|---|---|
 | `/` | 总览 | usage summary + 系统状态 |
 | `/channels` | 渠道管理 | `/api/channels` CRUD（含启用开关 / 权重 / 模型白名单） |
+| `/pricing` | 模型单价 | `/api/model-pricing` CRUD（列表 / 新增 / 编辑 / 启停 / 删除） |
 | `/usage` | 用量看板 | summary / breakdown / daily（ECharts 折线 + 排行） |
 | `/access-keys` | AccessKey 签发 | 签发（明文仅一次）/ 停用 / 改名 / 改 scope / 删除 |
-| `/system` | 系统状态 | 服务 uptime / 限流（**可编辑**）/ 密钥状态 / 渠道缓存 / 熔断器列表 |
+| `/system` | 系统状态 | 服务 uptime / 限流（**可编辑**）/ 密钥状态 / 渠道与密钥 / 异步落库 / 熔断器列表 |
 | `/logs` | 请求日志 | `/api/usage/logs` 筛选分页（链路 ID/调用方/IP/模型/渠道/provider/时间 + 耗时列 + 链路 ID 复制） |
 | `/playground` | 调试台 | 直接向 `/v1/chat/completions` 发真实请求 |
 
@@ -902,6 +936,20 @@ state/failures/opened_at/cooldown_remaining_sec（冷却倒计时）。
 | value | varchar(200) | 配置值（字符串，数字由调用方转） |
 | updated_at | datetime | 最近更新时间（GORM 自动） |
 
+### model_pricing（模型单价表，管理台可配置）
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| id | uint PK | 自增 |
+| model_name | varchar(100) unique | 模型名（如 `deepseek-chat`、`gpt-4o`） |
+| input_price | float | 输入单价（元 / 1K token） |
+| output_price | float | 输出单价（元 / 1K token） |
+| enabled | bool | 是否参与计价（停用 = 该模型走默认兜底价） |
+| created_at / updated_at | datetime | 创建 / 更新时间（GORM 自动） |
+
+首次启动（表为空）自动写入 7 条默认单价；`CalcCost` 经 `PricingCache` 内存快照读取，
+管理台 CRUD 后主动 `Refresh()`，改价立即生效无需重启。
+
 ---
 
 ## API 一览
@@ -913,6 +961,8 @@ state/failures/opened_at/cooldown_remaining_sec（冷却倒计时）。
 | GET/PUT/DELETE | `/api/channels/:id` | 渠道详情 / 更新 / 删除 |
 | GET/POST | `/api/access-keys` | AccessKey 列表 / 签发（明文仅一次） |
 | PUT/DELETE | `/api/access-keys/:id` | 改名 / 改 scope / 启停 / 删除 |
+| GET/POST | `/api/model-pricing` | 模型单价列表 / 新增 |
+| PUT/DELETE | `/api/model-pricing/:id` | 改价 / 启停 / 删除 |
 | GET | `/api/usage/summary` | 用量总览 |
 | GET | `/api/usage/breakdown?group=model\|channel` | 用量分组排行 |
 | GET | `/api/usage/daily` | 用量按天趋势 |
@@ -945,17 +995,20 @@ llm-gateway/
 │   │   ├── access_key.go     # AccessKey 签发/CRUD + Bearer 鉴权中间件（可信身份）
 │   │   ├── request_log.go    # 请求级日志落盘（一条 requestID 一个文件 + RequestLogf 统一入口）
 │   │   ├── logfile.go        # 日志文件列表/下载（安全校验防路径穿越）
-│   │   ├── system_status.go  # 系统状态快照（注入 limiter，实时生效值）
+│   │   ├── system_status.go  # 系统状态快照（注入 limiter + usageWriter，实时生效值）
 │   │   ├── ratelimit_admin.go# 限流配置 GET/PUT + settings 持久化
+│   │   ├── model_pricing.go  # 模型单价 CRUD（改价后主动刷新缓存）
+│   │   ├── usage_writer.go   # 异步落库：内存 channel 版（批量攒 + 500ms flush）
+│   │   ├── usage_writer_redis.go # 异步落库：Redis Streams 消费组版（XADD/XREADGROUP/XACK）
 │   │   └── usage_dashboard.go# 用量看板 + 请求日志 API（查询时聚合）
-│   ├── model/             # Channel / AccessKey / UsageLog / Setting（GORM 模型）
+│   ├── model/             # Channel / AccessKey / UsageLog / Setting / ModelPricing（GORM 模型）
 │   ├── ratelimit/         # 滑动窗口限流（memory / Redis + Lua；SetLimit 运行时可调）
 │   ├── router/            # 路由注册 + 依赖注入（启动读 settings 恢复限流值）
-│   ├── storage/           # SQLite 初始化 + AutoMigrate
-│   └── usage/             # Token 估算 + 模型单价表 + 费用计算
+│   ├── storage/           # SQLite 初始化 + AutoMigrate（全表统一建表）
+│   └── usage/             # Token 估算 + PricingCache 单价缓存 + 费用计算
 ├── web/                   # Web 管理台（React 19 + Vite + TS + framer-motion）
 │   └── src/
-│       ├── pages/         # Overview / Channels / Usage / AccessKeys / SystemStatus / RequestLogs / Playground
+│       ├── pages/         # Overview / Channels / ModelPricing / Usage / AccessKeys / SystemStatus / RequestLogs / Playground
 │       ├── api.ts         # 全部 /api/* 的 TS 封装
 │       └── components/    # Icon、布局、全局样式
 └── requests.http          # 手动测试用例集合（IDE 可点击发送）
@@ -981,7 +1034,7 @@ go test ./... -count=1    # 全量单测
 | internal/handler | 限流设置接口 | GET 初始 60 → PUT 3 运行时立即生效 + settings 落库 → 非法值 400 不改运行时值 |
 | internal/handler | 系统状态 | 聚合字段齐全、熔断快照合并懒创建渠道、enabled/limit 读实时 limiter |
 | internal/ratelimit | 滑动窗口 + 运行时调整 | 窗口内计数、超限拒绝、窗口滑过恢复、SetLimit 改上限立即生效 |
-| internal/usage | 估算 + 计价 | ASCII/中文估算、已知单价、前缀匹配 |
+| internal/usage | 估算 + 计价 + 单价缓存 | ASCII/中文估算、已知单价精确匹配、未知模型默认兜底、前缀测试改精确匹配 |
 
 > 注：`go test -race` 需要 CGO（本机无 gcc 时不可用），并发正确性由
 > `atomic.Pointer` + 互斥锁设计保证，并有用例覆盖并发读写。
@@ -1010,5 +1063,8 @@ go test ./... -count=1    # 全量单测
 | 请求审计怎么做 | request_id 链路 ID（401 也有）+ 调用方（access_key_name）+ IP + duration_ms/首响应（TTFT）；mark 时算差值，本地 <1ms 显示 <1ms |
 | 慢请求怎么定位 | duration_ms（总耗时）vs first_response_ms（TTFT）：首高 = 上游开口慢；首正常总长 = 生成/传输慢 |
 | 计费为什么流水表 | 只 INSERT 无锁竞争，聚合放读侧；usage 缺失用估算兜底，口径统一 |
-| 管理台页面 | 七页全覆盖：渠道 / 用量 / AccessKey / 系统状态（限流可编辑）/ 请求日志 / 调试台（发真实请求 + curl 展示） |
+| 单价为什么配置化 | 单价是低频变更的高频读——DB 存 + 内存缓存 + 管理台 CRUD 后主动 Refresh，改价立即生效；精确匹配 → 默认兜底，不搞隐式前缀 |
+| 记账为什么异步 | 响应完成是主流程，记账是附属流程；channel/Redis Stream 攒批落库，客户端不等 fsync；队列满 fail-open 丢弃不阻塞主链路 |
+| 异步落库为什么双后端 | memory = 零依赖单机；Redis Stream = 多实例共享 + 消费组 + 未 ACK 可重放；USAGE_LOG_BACKEND 一键切换 |
+| 管理台页面 | 八页全覆盖：渠道 / 模型单价 / 用量 / AccessKey / 系统状态（限流可编辑 + 异步落库卡片）/ 请求日志 / 调试台（发真实请求 + curl 展示） |
 | 压测/量化 | （W3-④ 待回填）单实例 QPS、流式首字延迟、故障转移 P99、限流精度 |

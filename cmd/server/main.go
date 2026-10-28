@@ -4,6 +4,8 @@ package main
 import (
 	"io"
 	"log"
+	"net/http"
+	_ "net/http/pprof" // pprof 分析端点：监听 6060，/debug/pprof/profile 采样 CPU
 	"os"
 	"path/filepath"
 
@@ -53,6 +55,16 @@ func main() {
 
 	// ④ 创建 gin 引擎并注册路由（把 db、加密服务、配置传给路由层做依赖注入）
 	r := router.New(db, enc, cfg)
+
+	// ④.5 pprof 分析端点：独立起一个 6060 端口挂 DefaultServeMux
+	// 用法：压负载时 `curl http://localhost:6060/debug/pprof/profile?seconds=10 -o cpu.prof`
+	// 然后 `go tool pprof cpu.prof` 分析 CPU 热点（标准做法，线上排查利器）
+	go func() {
+		log.Printf("pprof 已启动: http://localhost:6060/debug/pprof/")
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			log.Printf("pprof 启动失败: %v", err)
+		}
+	}()
 
 	// ⑤ 启动 HTTP 服务并监听端口（阻塞运行）
 	//    r.Run 返回（Ctrl+C）后 defer 执行：drain 异步日志队列剩余条目
