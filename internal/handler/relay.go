@@ -7,7 +7,6 @@ import (
 	"encoding/json" // JSON：解析/重组 SSE 事件
 	"errors"       // 错误判断：识别 io.EOF 结束流
 	"io"           // 流操作：读取请求体、复制响应体
-	"math/rand/v2" // 随机数：加权随机选渠道（rand.IntN 是 Go 1.22+ 推荐写法）
 	"net"          // 连接层：Dialer 超时（连接/KeepAlive 分层超时）
 	"net/http"
 	"strconv" // 字符串转整数：限流 key 拼 akID
@@ -20,6 +19,7 @@ import (
 	"llm-gateway/internal/crypto"
 	"llm-gateway/internal/model"
 	"llm-gateway/internal/ratelimit"
+	"llm-gateway/internal/scheduler"
 	"llm-gateway/internal/usage"
 )
 
@@ -36,6 +36,7 @@ type RelayHandler struct {
 	breakers *circuitBreakers // 熔断器注册表：跨请求统计渠道连续失败，自动摘除/恢复
 	limiter  ratelimit.Limiter // W3 限流器：滑动窗口（memory 本地 / redis 分布式）
 	usageWriter UsageWriter // 异步用量日志落库（主链路不被写库阻塞；接口类型，可换内存/Redis 实现）
+	scheduler *scheduler.FairScheduler // 公平调度器：账本式渠道选择（替代加权随机）+ 渠道×模型冷却
 }
 
 // NewRelayHandler 构造器：注入 db、加密服务、渠道缓存、限流器、异步落库器
@@ -76,6 +77,7 @@ func NewRelayHandler(db *gorm.DB, enc crypto.Service, cache *channelCache, limit
 		breakers: newCircuitBreakers(),
 		limiter:  limiter,
 		usageWriter: usageWriter,
+		scheduler:  scheduler.New(0), // 公平调度器：默认 10s 模型冷却（渠道×模型粒度）
 	}
 }
 
@@ -271,19 +273,21 @@ func upstreamErrorSummary(body []byte) string {
 	return msg
 }
 
-// pickChannel 按权重加权随机选一个启用的渠道（W2 调度 + W3 排除已试）
+// pickChannel 按公平调度选一个启用的渠道（W2 调度 + W3 排除已试 + 渠道×模型冷却）
 //
 // excluded：已经试过且失败的渠道 ID 集合（故障转移的核心：失败的不再选）
 // modelName：客户端请求里的模型名（路由层：渠道声明支持该模型才进候选池）
 //
-// 算法（前缀区间法）：
-//   权重数组 [1, 2, 3] → 总权重 6 → 想象一条分成 1:2:3 三段的刻度尺
-//   生成随机数 n ∈ [0, 6)，落在哪段就选谁：
-//     n=0       → 渠道A（概率 1/6）
-//     n=1,2     → 渠道B（概率 2/6）
-//     n=3,4,5   → 渠道C（概率 3/6）
+// 算法（公平调度，替代旧的加权随机）：
+//   加权随机的问题：短窗口内可能连续 N 次打中同一渠道（随机抖动），
+//   且无状态——谁被饿死完全不感知。
+//   公平调度 = 每个渠道一个"欠账本"（share = 累计被选次数 / weight）：
+//     - 永远选欠得最多的（确定性轮流，无随机）
+//     - weight 大 → share 涨得慢 → 被选更频繁（流量按权重比例，锁死）
+//     - 失败过的 (渠道, 模型) 进入冷却期，期内不参与该模型调度
+//   思想同源 Linux CFS 调度器的 vruntime。
 //
-// 排障日志：每个候选渠道被过滤时都打印原因（已试/模型不匹配/熔断/禁用），
+// 排障日志：每个候选渠道被过滤时都打印原因（已试/模型不匹配/熔断/冷却/禁用），
 //   否则"无可用渠道"时只能瞎猜是哪个条件挡住的。
 func (h *RelayHandler) pickChannel(c *gin.Context, excluded map[uint]struct{}, modelName string) (model.Channel, error) {
 	// ① 从内存快照读启用渠道（无锁；替代每请求查库——配置热更新的读路径）
@@ -322,19 +326,22 @@ func (h *RelayHandler) pickChannel(c *gin.Context, excluded map[uint]struct{}, m
 		return model.Channel{}, gorm.ErrRecordNotFound // 没有可用的了（全试完/无启用渠道）
 	}
 
-	// ③ 计算总权重，生成 [0, total) 随机数，逐段扣减定位区间
-	total := 0
+	// ③ 公平调度选择（替代加权随机）：
+	//    每个渠道维护"欠账"（share=累计被选次数/weight），每次选欠得最多的 →
+	//    确定性轮流（无随机抖动）+ 比例锁死（weight 大 → share 涨得慢 → 流量多）
+	//    失败过的 (渠道, 模型) 会进入冷却期，在这里被一并跳过
+	cands := make([]scheduler.Candidate, 0, len(candidates))
 	for _, ch := range candidates {
-		total += ch.Weight
+		cands = append(cands, scheduler.Candidate{ID: ch.ID, Weight: ch.Weight})
 	}
-	n := rand.IntN(total)
-	for _, ch := range candidates {
-		n -= ch.Weight
-		if n < 0 { // 掉进这个渠道的区间 → 选中它
-			return ch, nil
-		}
+	idx, ok := h.scheduler.Select(cands, modelName, time.Now())
+	if !ok {
+		RequestLogf(c, "[pick] 公平调度无可选（候选 %d 个全在冷却/不可用）", len(candidates))
+		return model.Channel{}, gorm.ErrRecordNotFound
 	}
-	return candidates[len(candidates)-1], nil // 兜底：理论上不会走到这
+	chosen := candidates[idx]
+	RequestLogf(c, "[pick] 公平调度选中渠道 id=%d %s（weight=%d，共 %d 候选）", chosen.ID, chosen.Name, chosen.Weight, len(candidates))
+	return chosen, nil
 }
 
 // containsModel 判断渠道的 models 列表是否包含目标模型
@@ -849,6 +856,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			appendAttempt(c, ch, 0, time.Since(attemptStart).Milliseconds(), "密钥解密失败: "+err.Error(), true)
 			tried[ch.ID] = struct{}{}
 			h.breakers.recordFailure(ch.ID, time.Now()) // 密钥坏了也算渠道故障，累计熔断
+			h.scheduler.RecordFailure(ch.ID, reqMeta.Model, time.Now()) // 渠道×模型冷却：该渠道×该模型进入冷却，公平调度期内的候选排除
 			continue
 		}
 
@@ -890,6 +898,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			appendAttempt(c, ch, 0, time.Since(attemptStart).Milliseconds(), "网络失败: "+err.Error(), true)
 			tried[ch.ID] = struct{}{}
 			h.breakers.recordFailure(ch.ID, time.Now())
+			h.scheduler.RecordFailure(ch.ID, reqMeta.Model, time.Now()) // 渠道×模型冷却
 			continue
 		}
 
@@ -901,6 +910,7 @@ func (h *RelayHandler) ChatCompletions(c *gin.Context) {
 			upResp.Body.Close() // 显式关闭，释放连接（不用 defer——循环里会累积）
 			tried[ch.ID] = struct{}{}
 			h.breakers.recordFailure(ch.ID, time.Now())
+			h.scheduler.RecordFailure(ch.ID, reqMeta.Model, time.Now()) // 渠道×模型冷却
 			continue
 		}
 
